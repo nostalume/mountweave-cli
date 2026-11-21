@@ -1,0 +1,13 @@
+{
+  "version": "0.1.0",
+  "description": "Mount and serve local and remote storage.",
+  "homepage": "https://github.com/nostalume/mountweave-cli",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/nostalume/mountweave-cli/releases/download/v0.1.0/mweave_v0.1.0_windows_amd64.zip",
+      "hash": "35f5474ccc6e206849076cdd3f6c757ae09b5700222fa4a59e5c1a626fd5e071"
+    }
+  },
+  "bin": "mweave.exe"
+}
