@@ -1,206 +1,136 @@
-# Architecture
+# CLI architecture
 
-The initial CLI design uses Mountweave v0.2.0. The
-[specification](specification.md) defines observable behavior and the
-[verification matrix](specification.md#verification-and-delivery) identifies
-what delivery must demonstrate.
+mweave is a host for [Mountweave](https://github.com/nostalume/mountweave).
+It connects a user's storage once, then offers the same mount to file
+commands and protocol clients. The [CLI specification](specification.md)
+defines behavior. This page identifies the owner of each design decision.
 
-A person connects an account or storage location once, then works with files
-through the same visible mount path. An automated caller uses that mount or
-supplies a previously prepared credential reference. The provider establishes
-the account and grants access. The CLI selects the available connection method,
-collects the remaining inputs and builds a Mountweave Driver.
-
-| Owner | Responsibility |
-| --- | --- |
-| CLI host | Command and configuration input, credential resolution and storage, caller identity, process and listener lifetime, and local download publication |
-| Driver integration | Typed native settings, supported authorization methods, root discovery where available, native client and Driver construction |
-| Mountweave | File addresses, authorization checks, file operations, native resources and protocol adapters |
-
-A saved mount contains a visible path, its source name, the connection method
-when the service offers a choice, native location settings and an optional
-credential reference. The credential has its own lifetime. It can
-authorize more than one mount, and reauthorizing it must preserve the intended
-provider account. The saved mount stays separate from any live Driver instance.
+```text
+command or wizard ──► saved config ──► typed source + credential reference
+                                              │
+                                      native Driver instance
+                                              │
+                                    Core mount and authority
+                                      │                  │
+                                  file command       protocol adapter
+```
 
 ## Architecture decisions
 
-| Decision | Reason and contract |
+| Boundary | Owner and invariant |
 | --- | --- |
-| Choose the service and save its resolved connection | The catalog lists each service once. The selected connection fixes its typed options, credential audience and native constructor. Prompts, help and configuration use the same catalog. [Onboarding](specification.md#connect-a-mount) |
-| Separate saved configuration from active bindings | A file edit and a running mount have different effects. A complete, conflict-checked save makes future intent durable. One-shot commands read it on invocation and exports use it on restart. [Configuration](specification.md#changing-configuration) |
-| Own credentials by authorization record | A mount can change names and several mounts can refer to one grant. Scope checks and refresh ownership follow the grant and its intended recipient. [Credentials](specification.md#editing-credentials) |
-| Use Core addresses and file operations | Humans, automation and adapters act on the same mounted files. Literal object keys survive parsing, and existing Core effects describe what changed. The CLI owns publication to a local download destination. [Commands](specification.md#commands-and-arguments) |
-| Apply one Core authorization policy per export | The protocol supplies client identity and wire semantics. The host binds the identity to the configured root and access policy, and Core checks each endpoint. [Protocol setup](specification.md#protocol-setup) |
-| Let the invoking process own its resources | A file command constructs the mounts it uses. A foreground server owns its listeners, active mounts and shutdown. Core and Drivers retain ownership of their operation resources. [Process lifecycle](specification.md#process-lifecycle) |
-| Project one operation result for people and scripts | Human and JSON output preserve the same effects, including partial changes and uncertain outcomes. Raw streams use stdout for bytes. [Results and exit status](specification.md#results-and-exit-status) |
-
-These decisions cover the path from a saved mount or export through an active
-Core binding to an operation result. The initial verification covers Local
-and WebDAV sources, an S3 exact-key fixture, and WebDAV, JSON HTTP, SFTP and FTP exports.
-Additional routes use the same construction and activation path with evidence
-for their native requirements.
+| Command and configuration | The CLI parses arguments and persists public intent. One complete config snapshot is saved at a time. A running `serve` keeps its startup snapshot. |
+| Source and authorization | A visible service plus optional connection selects typed settings and a Driver. A grant is a separate protected record; permission to use it follows the provider account, scope and recipient. |
+| Files | Core owns the file address, mount selection, authorization and operation effects. The Driver owns native requests, root checks, paging, ranges and receipts. |
+| Protocol clients | The host owns listener configuration and client identity. The adapter owns wire framing, protocol sessions and request resources. Core enforces the configured root and access for each operation. |
+| Results | The same outcome drives human-readable and JSON replies. Preserve partial effects and uncertain outcomes. The CLI owns local publication for named downloads and keeps diagnostics off a byte stream. |
 
 ## Command boundaries
 
-Mount and export commands manage saved settings. File commands use mounted
-addresses, and `serve` uses the selected export settings to start listeners.
-The same visible mount path connects setup to file access. Saved definitions
-describe intent. The file operation reports the access observed during its
-invocation.
+One command definition owns help, operands and accepted options
+([`commands.go`](../internal/cliapp/commands.go)). `mount` and `export` manage saved
+settings. File commands construct only the mounts they need; `serve`
+constructs and shares the mounts used by its listeners. `mount list` and
+help do not connect to providers. A new file operation should reuse the
+existing Core address and effect model.
+[Command input](../internal/cliapp/run.go) provides prompts and reads `--from`
+records for both mount and export setup.
 
-Keep frequent file operations and `serve` at the top level. Use scoped help
-for mount and export maintenance and for Driver options. One command
-definition provides usage, operand and option validation, and help. Help
-uses build-time information. File and server commands resolve the settings
-they need when invoked.
-[Command navigation](specification.md#command-navigation)
+Configuration publication compares the edited snapshot under the writer
+lock before replacing the file. Saved local paths resolve from the actual
+configuration directory; command-line local operands resolve from the
+invocation directory. See the [configuration contract](configuration.md#configuration-and-secrets)
+for strict input and recovery rules.
 
 ## Adding services
 
-Users choose a named storage service or an access type such as WebDAV.
-A service can offer several connection methods, each with its own access and
-credential requirements. The catalog chooses the Driver from the saved service
-and connection. It does the same for interactive mounts, explicit records and
-Pool members.
+The [source catalog](../internal/cliapp/source.go) maps a saved service/connection to
+typed options and one native constructor. The same route serves interactive
+setup, explicit records and Pool members. Presets expand into concrete
+settings before saving, so future preset changes do not retarget existing
+mounts. A source can use the wizard or accept records only. Both paths use the
+same prepared options and credential rules.
 
-The CLI owns that choice, its configuration and any browser session. Source
-modules own provider requests, native identity, paging and streaming.
-A browser used only for consent can close after the grant is issued. A source
-that needs the session for file requests borrows it from the host. Core sees
-the resulting Driver in either case.
-Use the same typed input definitions for prompts, help and unattended
-configuration. The Driver still validates native settings and effects.
-Routes with the same inputs and semantics share the typed setup. For example,
-115 Open and 123 Open use the same account-folder options and prompts. Each
-still selects its own native constructor and credential recipient. A drive
-selector can reuse the folder prompt and the bearer client independently.
-Use a Driver's native options directly when they declare the public fields
-and exclude runtime resources from JSON. This keeps option validation with
-the constructor. Pool and similar compositions describe their additional
-prerequisites through the same entry point.
-
-| What differs | Where to add it |
+| Change | Start here |
 | --- | --- |
-| URL, region, native options or provider setup instructions | A small preset or a documented example for an existing Driver. S3-compatible services share the same Driver with explicit endpoint, signing and listing settings. |
-| Authorization flow or credential audience | A provider integration that uses the existing setup sequence and credential references. |
-| File API or native behavior | The appropriate Mountweave Driver, with a thin CLI integration for typed options, credentials and construction. |
+| New settings for an existing protocol | Add a preset when the service only varies in native options, endpoint or sign-in instructions. S3 presets share the same Driver. |
+| New authorization or connection method | Reuse the setup and protected credential store. Record the actual recipient and verify scope before the first probe. |
+| New remote file semantics | Implement them in the [Mountweave Driver](https://github.com/nostalume/mountweave/blob/v0.3.0/docs/architecture.md); register its native constructor and typed settings in the CLI. |
+| Custom program using mweave | Register a [typed source](../CONTRIBUTING.md#custom-builds). Let Core see the native Driver's optional capabilities directly. |
 
-Keep presets bundled with the application. The wizard resolves a preset to
-concrete connection settings before saving. Upgrading a preset affects new
-setup and explicit edits. Existing endpoints, roots and credential references
-come from the saved configuration. Explicit connection choices determine where
-credentials are sent. File commands operate on a mount through Core.
-[Mountweave architecture](https://github.com/nostalume/mountweave/blob/v0.2.0/docs/architecture.md) · [S3-compatible settings](https://github.com/nostalume/mountweave/blob/v0.2.0/drivers/s3/README.md#compatible-s3-services)
+115 Open and 123 Open share an account-folder input but have separate
+constructors and credential recipients. [Website setup](../internal/stock/website_setup.go)
+owns profile creation, confirmation, and publication. Driver adapters verify
+the account and folder. LanZou saves a new credential reference on reconnect.
+Aliyun can reuse one authorization across several roots, and verifies every
+bound root before replacing the shared authorization.
 
-Reuse the SDK and native constructor for client setup and root validation.
-A successful `Core.Install` transfers Driver ownership. The host closes a
-rejected Driver, including any non-nil Driver returned with an error, and owns
-borrowed clients. A custom binary imports `cli` and assembles its sources once.
-The same catalog drives help, setup and runtime. Source constructors return
-the native Driver so Core can use its optional capabilities directly.
+## Source code ownership
 
-A Pool is one visible mount with its own metadata and private members. The
-host constructs each member through the same source catalog. Pool takes
-ownership after it opens successfully. Core then owns the Pool through
-its normal mount lifecycle. Placement, reconstruction and write admission
-belong to Pool. [Custom builds and Pool setup](specification.md#custom-builds)
+`cli.New` assembles the [stock sources](../internal/stock/sources.go) and any supplied
+extensions. `host.New` assembles the supplied sources. Both return the same
+App, with orchestration in `internal/cliapp`. [Local](../cli/source/local/local.go)
+and [WebDAV](../cli/source/webdav/webdav.go) can be selected in an explicit
+build. The stock WebDAV entry and the 123, Nutstore and FEB presets use the
+same WebDAV constructor. The catalog registers mount choices. Stock keeps public
+settings together by shared resource shape, with separate files for consent,
+credential rotation, and website wiring.
+
+| Code | Responsibility |
+| --- | --- |
+| Source catalog and setup | Select a service and connection, collect public settings, and open the native Driver. The prepared mount supplies any review details to the wizard. Directory inputs live in [account folder settings](../internal/stock/folders.go). |
+| Authorization | Keep provider consent and connection setup together. [Credential HTTP transport](../internal/cliapp/credential_http.go) owns the reusable recipient checks and request headers. |
+| Website mounts | [Stock setup](../internal/stock/website_setup.go) connects the native verifier to publication, cleanup, and grant leases. [Browser lifecycle](../internal/website/lifecycle.go) is shared with the browser-check tool. |
+| Native storage | Drivers own account and root proofs, object IDs, listing and body receipts. |
+| Shared host resources | [File locks](../internal/filelock/) own acquisition and cancellation. Config and authorization callers assign their own conflict and recovery behavior. |
 
 ## Running commands and protocol endpoints
 
-Use the same native construction for one-shot commands and `serve`. One-shot
-commands pay setup only for the mounts they use, and the foreground process
-shares active mounts across its listeners. Each listener authenticates a
-principal scoped to its export. The selected directory supplies the protocol root and the Core authorization
-boundary. JSON HTTP uses absolute Core paths under that boundary. S3 maps
-one path-style bucket to a native object key binding and passes the original
-HTTP request target directly to the SigV4 adapter. Core authorizes the exact
-key space. The adapter owns signatures, body validation and listing tokens.
-For multipart, the host owns the private manifest database, Input store,
-and the stable identity of the configured target. The adapter owns part
-replacement, completion and cleanup. Core publishes the selected input.
-Shutdown waits for handlers and recovery to finish before releasing the
-state lock. For SFTP the host owns SSH
-keys, authentication and connection cancellation. The SFTP adapter owns
-file handles and directory cursors. FTP shares SFTP's TCP connection
-lifecycle. The host binds passive listeners and checks the remote IP. The
-FTP adapter owns each data connection, transfer cancellation and publication.
-All control listeners bind before readiness and share one shutdown deadline. Core checks file authority and retires native
-resources.
+In [`mount_runtime.go`](../internal/cliapp/mount_runtime.go), successful `Core.Install`
+transfers Driver ownership. The caller closes a rejected instance. Pool
+follows the same pattern. The [host](../internal/cliapp/pool_config.go) admits
+members before opening any, then passes their Drivers to the selected Pool
+constructor. Pool takes ownership on success. Core then owns the Pool.
+Metadata, placement and degraded file access belong to Pool.
 
-If there is a need for online mount changes, evaluate the existing Control
-package for explicit, per-mount application. Control retires an old mount
-before constructing its replacement. A failed construction can leave that
-mount unavailable, and applying several definitions yields per-mount results.
-Preserve Core's binding and retirement semantics when changing the running
-namespace. Listener changes can continue to use restart.
-[Mountweave Control contract](https://github.com/nostalume/mountweave/blob/v0.2.0/control/doc.go)
+[Export setup](../internal/cliapp/export.go) defines, validates, and saves the
+same record for the wizard and `--from`. [Serving](../internal/cliapp/serve.go) assigns
+each listener its own Core principal and binds all listeners before reporting
+readiness. Startup failure rolls back acquired resources. Shutdown stops
+acceptance, drains requests within a shared budget and waits for retirement.
+
+- WebDAV, JSON HTTP, SFTP and FTP map directory operations into the same
+  Core authorization. The [TCP export](../internal/cliapp/serve_tcp.go) shares
+  connection tracking and shutdown for SFTP and FTP. SFTP owns bound handles.
+  FTP owns passive data transfers, with a peer check at the listener.
+- [HTTP handlers](../internal/cliapp/serve_http.go) bind JSON HTTP, WebDAV and
+  S3 to Core. S3 preserves the original request target for signing, routing
+  and native execution. The host owns private multipart state and its lock.
+  The adapter owns upload sessions, and Core owns publication. Release the
+  lock after handlers and maintenance finish.
 
 ## Authorization ownership
 
-| Available provider contract | Onboarding choice |
-| --- | --- |
-| Existing authorized client or profile | Reuse it. S3 can use the AWS SDK configuration chain. [AWS SDK configuration](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-gosdk.html) |
-| Scoped app password or access token | Guide the user to the provider's issuance page when needed. Import through a protected input or resolve an existing reference. |
-| Browser consent with a local callback | Use the system browser and the callback and PKCE parameters the provider supports. [OAuth for native apps](https://www.rfc-editor.org/rfc/rfc8252.html) |
-| Consent on another device | Use the provider's device authorization flow and observe its polling interval, terminal states and expiry. [Device authorization](https://www.rfc-editor.org/rfc/rfc8628.html) |
-| App credentials exchange for access | Resolve approved application credentials through protected references and bind the returned access to its authorized subject and recipient. |
+Provider consent and file permission are distinct. A credential reference
+identifies a provider grant, an external profile or a host secret. A file
+command can use it or fail with a next action; it does not start interactive
+authorization. Compare recipient and scope before sending a credential to a
+source, including during a mount probe. Export credentials authenticate
+protocol clients and stay separate from source credentials.
 
-Application ownership is independent of the consent flow. A user-supplied
-application can use browser consent. An approved shared public client reduces
-setup for users and gives the project responsibility for registration, quotas
-and availability. A distributed binary cannot keep a client secret confidential.
-A confidential client belongs to its authorized operator or backend.
+Reauthorization of a shared grant preserves the account and scope.
+Switching accounts changes one mount. Restoring a missing grant preserves
+the saved folder and asks for confirmation when native verification cannot
+prove the old binding. See the [credential contract](configuration.md#editing-credentials).
 
-The selected source defines the accepted authorization methods, required
-permissions, stable account identity and credential recipients. The CLI owns
-interaction and persistence. The native Driver verifies the selected root
-and runs file operations. For sources with interactive managed authorization,
-reauthorization replaces the same account's grant and retains the scope needed
-by shared mounts. Switching accounts verifies the new root and updates one
-mount reference. Ordinary edits and automation can reuse a saved reference.
+The host owns protected storage, leases, and publication. Reusable refresh
+and app credentials share the access-token cache. On reauthorization,
+reusable grants take the writer lease after consent and recheck the current
+record. App credentials take it before the exchange. Static approvals stay
+in the protected store and can be replaced by switching the mount.
 
-An external profile follows the provider or SDK's own lifecycle. For a
-reusable refresh credential, a current access token can serve requests from
-memory. A renewal takes the writer lock for the grant, reloads the latest
-record and saves the accepted update. Retry with the previous refresh
-credential only when the provider contract permits it. Dropbox and Google
-Drive use this path with different callback and application requirements.
-[Dropbox authorization](https://docs.dropboxapi.com/riviera/docs/get-started/authorization) ·
-[Google desktop authorization](https://developers.google.com/identity/protocols/oauth2/native-app)
-
-123 Open issues another access token from an approved application credential
-pair. It shares the access-token cache and writer lock with reusable refresh
-tokens. The grant stores a reference to the secret. Each newly issued token
-must resolve to the original account before it can reach file requests.
-
-Microsoft Graph device authorization pins the Entra tenant and binds the
-grant to the account returned by Graph. Renewals keep the same tenant,
-client and account. The cache publishes the new token pair together.
-Entra permits using the previous refresh credential when the result of
-renewal is lost. [Microsoft Entra refresh tokens](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens)
-
-A CLI-managed grant whose refresh can consume the old credential needs
-one durable record and one refresh owner at a time. Coordinate by the
-record's identity across CLI and `serve` processes. It stays stable when the
-mount path or token changes. Protect the record and record the attempt before
-sending a refresh that can invalidate it.
-
-With Mountweave v0.2.0, an AliPan Driver owns and closes its credential
-source. Its process lock spans Driver construction, use and cleanup. Independent Drivers for the same rotating record therefore
-require a proven shared-owner or borrowing contract. When the owner is
-busy, a second direct invocation reports the conflict and can use an
-already configured export if it covers the operation. On restart load the
-latest confirmed checkpoint or reconcile an uncertain rotation before resuming.
-[AliPan credential contract](https://github.com/nostalume/mountweave/blob/v0.2.0/drivers/alipan/README.md#rotating-credentials)
-
-115 Open borrows an authenticated HTTP client. The CLI owns its rotating
-credential source and closes it before releasing the writer lock. Its phone
-scan and token endpoints belong to the provider adapter. The managed
-authorization setup shares account selection, reauthorization and publishing
-with the browser flow. The existing file Driver confirms directory access.
-
-Cookie import from browser sessions is outside the initial design. For
-browser-based OAuth, the browser may reuse its existing provider login and the
-CLI receives the authorization result. Any future cookie-based connection needs
-a documented service contract and separate review of scope, expiry and storage.
+Reauthorizing a saved rotating grant takes an exclusive lease before
+consent. A live rotating source holds that lease through cleanup. The
+native rotation state machine durably records pending exchanges. The AliPan Driver owns its credential source. The host closes
+the credential source borrowed by 115 Open. Uncertain exchanges require
+recovery before reuse.

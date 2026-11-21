@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+
+jobs:
+  check:
+    name: Go / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Test and vet default and Pool builds
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test -mod=readonly -v ./...
+          go vet -mod=readonly ./...
+          go test -mod=readonly -tags=mweave_pool -v ./...
+          go vet -mod=readonly -tags=mweave_pool ./...

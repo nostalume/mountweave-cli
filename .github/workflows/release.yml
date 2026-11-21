@@ -1,0 +1,220 @@
+name: Release artifacts
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+
+jobs:
+  archive:
+    name: Archive / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux_amd64
+            binary: mweave
+            extension: tar.gz
+          - runner: windows-2025
+            target: windows_amd64
+            binary: mweave.exe
+            extension: zip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release source
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:GITHUB_REF_NAME -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$') {
+            throw 'Use a vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N tag.'
+          }
+          $revision = git rev-parse HEAD
+          $tagged = git rev-parse ("refs/tags/{0}^{{commit}}" -f $env:GITHUB_REF_NAME)
+          $eventRevision = git rev-parse ("{0}^{{commit}}" -f $env:GITHUB_SHA)
+          if ($revision -ne $tagged -or $revision -ne $eventRevision -or (git status --porcelain)) {
+            throw 'The checkout must be clean and match the release tag and event revision.'
+          }
+          git merge-base --is-ancestor $revision refs/remotes/origin/main
+          if (!(Test-Path -LiteralPath LICENSE -PathType Leaf)) {
+            throw 'Add the approved project LICENSE before tagging a release.'
+          }
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build and archive
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+          PACKAGE_TARGET: ${{ matrix.target }}
+          PACKAGE_BINARY: ${{ matrix.binary }}
+          PACKAGE_EXTENSION: ${{ matrix.extension }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $target = "$(go env GOOS)_$(go env GOARCH)"
+          if ($target -ne $env:PACKAGE_TARGET) { throw "Unexpected build target $target." }
+          $stage = Join-Path $env:RUNNER_TEMP stage
+          $output = Join-Path $env:RUNNER_TEMP archives
+          New-Item -ItemType Directory $stage, $output | Out-Null
+          $binary = Join-Path $stage $env:PACKAGE_BINARY
+          go build -mod=readonly -buildvcs=true -trimpath -o $binary .
+          $revision = git rev-parse HEAD
+          $metadata = (go version -m $binary) -join [Environment]::NewLine
+          if ($metadata -notmatch "(?m)^\s*build\s+vcs\.revision=$revision\s*$" -or
+              $metadata -notmatch '(?m)^\s*build\s+vcs\.modified=false\s*$') {
+            throw 'Go build information does not identify the clean release revision.'
+          }
+          Copy-Item -LiteralPath LICENSE -Destination $stage
+          $licenses = Join-Path $stage 'licenses'
+          $packages = go list -mod=readonly -deps -f '{{if .Standard}}go|{{(context).GOROOT}}|{{.Dir}}{{else if and .Module (not .Module.Main)}}{{.Module.Path}}|{{.Module.Dir}}|{{.Dir}}{{end}}' . |
+            Where-Object { $_ }
+          $seen = [Collections.Generic.HashSet[string]]::new()
+          foreach ($package in $packages) {
+            $path, $root, $directory = $package.Split('|', 3)
+            while ($directory -and $seen.Add($directory)) {
+              $files = @(Get-ChildItem -LiteralPath $directory -File |
+                Where-Object Name -Match '^(LICENSE|COPYING|NOTICE|COPYRIGHT|AUTHORS|PATENTS)(?:$|[._-])')
+              if ($files) {
+                $relative = [IO.Path]::GetRelativePath($root, $directory)
+                $dest = Join-Path (Join-Path $licenses $path) $relative
+                New-Item -ItemType Directory -Force -Path $dest | Out-Null
+                $files | Copy-Item -Destination $dest
+              }
+              if ($directory -eq $root) { break }
+              $directory = Split-Path -Parent $directory
+            }
+          }
+          $archive = Join-Path $output "mweave_$($env:GITHUB_REF_NAME)_$target.$($env:PACKAGE_EXTENSION)"
+          if ($IsWindows) {
+            Compress-Archive -LiteralPath $binary, (Join-Path $stage LICENSE), $licenses -DestinationPath $archive
+          } else {
+            tar -czf $archive -C $stage -- $env:PACKAGE_BINARY LICENSE licenses
+          }
+          "MWEAVE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+      - name: Smoke test the archive
+        shell: pwsh
+        env:
+          PACKAGE_BINARY: ${{ matrix.binary }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $smoke = Join-Path $env:RUNNER_TEMP smoke
+          New-Item -ItemType Directory $smoke | Out-Null
+          if ($IsWindows) {
+            Expand-Archive -LiteralPath $env:MWEAVE_ARCHIVE -DestinationPath $smoke
+          } else {
+            tar -xzf $env:MWEAVE_ARCHIVE -C $smoke
+          }
+          Set-Location -LiteralPath $smoke
+          $binary = Join-Path $smoke $env:PACKAGE_BINARY
+          $version = & $binary version --json | ConvertFrom-Json
+          if ($version.error -or $version.result -cne $env:GITHUB_REF_NAME) {
+            throw "Unexpected version in archive: $($version.result)."
+          }
+          $env:LOCALAPPDATA = Join-Path $smoke home
+          $env:XDG_CONFIG_HOME = $env:LOCALAPPDATA
+          New-Item -ItemType Directory data, $env:LOCALAPPDATA | Out-Null
+          '{"at":"/files","driver":"local","options":{"root":"data"}}' | Set-Content mount.json -Encoding utf8NoBOM
+          'sealed mweave fixture' | Set-Content input.txt -Encoding utf8NoBOM
+          & $binary --config config.json mount add --from mount.json
+          & $binary --config config.json put input.txt /files/sample.txt
+          & $binary --config config.json get /files/sample.txt output.txt
+          $expected = (Get-FileHash input.txt).Hash
+          if ((Get-FileHash output.txt).Hash -ne $expected) { throw 'Local bytes differ.' }
+
+          $socket = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+          $socket.Start()
+          $endpoint = $socket.LocalEndpoint
+          $address = $endpoint.ToString()
+          $socket.Stop()
+          $env:MWEAVE_SMOKE_PASSWORD = 'fixture-password'
+          $export = @{
+            protocol = 'webdav'
+            listen = $address
+            root = '/files'
+            auth = @{ username = 'smoke'; credential = @{ kind = 'env'; ref = 'MWEAVE_SMOKE_PASSWORD' } }
+          }
+          $export | ConvertTo-Json -Depth 5 | Set-Content export.json -Encoding utf8NoBOM
+          & $binary --config config.json export add --from export.json
+          $options = @{
+            PassThru = $true
+            WorkingDirectory = $smoke
+            RedirectStandardOutput = Join-Path $smoke 'serve.out'
+            RedirectStandardError = Join-Path $smoke 'serve.err'
+          }
+          if ($IsWindows) { $options.WindowStyle = 'Hidden' }
+          $server = Start-Process -FilePath $binary -ArgumentList '--config config.json serve' @options
+          try {
+            $curl = if ($IsWindows) { 'curl.exe' } else { 'curl' }
+            & $curl --fail --silent --show-error --noproxy '*' --retry 4 --retry-connrefused --retry-delay 1 --max-time 2 --user 'smoke:fixture-password' --output http.txt "http://$address/sample.txt"
+            if ((Get-FileHash http.txt).Hash -ne $expected) { throw 'WebDAV bytes differ.' }
+            if ($IsWindows) {
+              Stop-Process -Id $server.Id
+            } else {
+              /bin/kill -TERM $server.Id
+            }
+            if (!$server.WaitForExit(5000) -or (!$IsWindows -and $server.ExitCode -ne 0)) {
+              throw 'WebDAV did not stop within the expected time.'
+            }
+            $client = [Net.Sockets.TcpClient]::new()
+            try {
+              $client.Connect($endpoint.Address, $endpoint.Port)
+              throw 'WebDAV still accepts connections after stopping.'
+            } catch [Net.Sockets.SocketException] {
+              if ($_.Exception.SocketErrorCode -ne [Net.Sockets.SocketError]::ConnectionRefused) { throw }
+            } finally { $client.Dispose() }
+          } finally {
+            if (!$server.HasExited) { Stop-Process -Id $server.Id }
+            Get-Content -LiteralPath serve.out, serve.err
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ runner.temp }}/archives/*
+          if-no-files-found: error
+          compression-level: 0
+
+  assemble:
+    name: Collect release files
+    needs: archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - name: Verify the asset set and write checksums
+        shell: bash
+        run: |
+          dist="$RUNNER_TEMP/release"
+          cp -- install.sh install.ps1 "$dist/"
+          cd -- "$dist"
+          sha256sum -- "mweave_$GITHUB_REF_NAME"_linux_amd64.tar.gz \
+            "mweave_$GITHUB_REF_NAME"_windows_amd64.zip install.sh install.ps1 > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ github.ref_name }}
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          compression-level: 0

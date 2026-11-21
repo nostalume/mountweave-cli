@@ -1,67 +1,108 @@
 # Mountweave CLI
 
-A headless command-line host for [Mountweave](https://github.com/nostalume/mountweave).
-It is designed for local file work, scripting and serving the same mounts to
-external clients through Mountweave's protocol adapters.
+`mweave` mounts local folders, cloud drives, network shares and object
+storage. Browse the same files from a terminal or script, or serve them over
+WebDAV, JSON HTTP, SFTP, FTP/FTPS or S3. [Mountweave](https://github.com/nostalume/mountweave)
+provides file operations and protocol adapters.
 
-`mweave` connects local directories, network shares, cloud drives and object
-storage. It supports guided setup, browsing, file transfer and file management,
-and serves directories over WebDAV, JSON HTTP, SFTP and FTP, and object
-mounts over S3.
+## Install
 
-Build from this directory with Go 1.27 or newer. For a smaller binary, use
-`go build -trimpath -ldflags="-s -w" -o mweave .` on Linux or change the output
-name to `mweave.exe` on Windows. Omit `-ldflags` when you need debug symbols.
-The default build uses published dependencies and can be built with
-`GOWORK=off`. For capabilities under development, see the
-[candidate build](docs/specification.md#candidate-build).
+Release archives target Windows and Linux on x86-64. The installers select
+the latest stable release by default. Scoop and Nix follow the package
+metadata in this repository. To use a source checkout, see
+[Build from source](CONTRIBUTING.md#build-from-source).
 
-## Connect storage
+### Windows
 
-~~~sh
-mweave mount add /files
-mweave mount list
-~~~
+With Scoop installed, add the bucket and install the package.
 
-See [source setup and capabilities](docs/specification.md#source-options)
-for network shares, cloud drives, self-hosted storage and object stores.
-For direct cloud connections, see [Aliyun Drive Open](docs/specification.md#connect-aliyun-drive-open) and [Tencent Weiyun](docs/specification.md#connect-tencent-weiyun).
+```powershell
+scoop bucket add mweave https://github.com/nostalume/mountweave-cli
+scoop install mweave/mweave
+```
 
-## Work with files
+You can also download and run the PowerShell installer.
 
-~~~sh
-mweave ls /files --limit 20
-mweave stat /files --json
-mweave put ./report.pdf /files/report.pdf
-mweave get /files/report.pdf ./copy.pdf
-~~~
+```powershell
+Invoke-WebRequest -UseBasicParsing 'https://github.com/nostalume/mountweave-cli/releases/latest/download/install.ps1' -OutFile install.ps1
+.\install.ps1
+```
 
-Run the built binary from your shell or add it to your PATH. For automation,
-use `mount add --from FILE` or `mount add --from -` with a
-[mount record](docs/specification.md#configuration-and-secrets).
-Use `mweave help` for file commands, `mweave mount --help` for mount
-maintenance, and `mweave mount add --help` for source names.
-[Custom builds](docs/specification.md#custom-builds) can register an external
-Go Driver or enable a storage Pool.
+### Linux
 
-## Serve a mounted directory
+With Nix and flakes enabled, add the package to your profile.
 
-~~~sh
-mweave export add
-mweave serve
-~~~
+```sh
+nix profile add github:nostalume/mountweave-cli#mweave
+```
 
-Choose a mounted directory and a client credential reference. The guide
-defaults to WebDAV on loopback with read-only access. Scripts can supply a
-record with `export add --from FILE` and use `serve --json` to wait for
-readiness. SFTP uses a host private key and a client's public key. FTP
-uses passive transfers, with cleartext available only on loopback.
-S3 clients use path-style addressing and their own signing credentials.
-See [protocol setup](docs/specification.md#protocol-setup).
+You can also download and run the POSIX installer.
 
-- [Architecture](docs/architecture.md#architecture-decisions) explains the
-  decisions and ownership boundaries.
-- [CLI specification](docs/specification.md) defines commands, configuration,
-  output and protocol behavior.
-- [Verification and delivery](docs/specification.md#verification-and-delivery)
-  gives the acceptance cases and current evidence.
+```sh
+curl -fL https://github.com/nostalume/mountweave-cli/releases/latest/download/install.sh -o install.sh
+sh ./install.sh
+```
+
+Run `mweave version` to check the installed version. The scripts print the
+install location and any `PATH` setup it needs. To install a specific tag
+or use another directory, pass `--version TAG` or `--bin-dir DIR` on Unix
+and `-Version TAG` or `-BinDir DIR` on Windows. You can also download a
+versioned archive from [Releases](https://github.com/nostalume/mountweave-cli/releases),
+compare its SHA-256 with that release's `SHA256SUMS`, then extract the binary.
+The commands above follow the stable channels. Use your package manager to
+upgrade or uninstall. For a script install, rerun the script to upgrade or
+delete the installed executable to uninstall. Configuration and credentials
+remain in their user directories.
+
+## Mount a folder
+
+In a new working directory, create a directory named `data` and save a short
+file named `sample.txt` inside it. Run the first command, choose `local`,
+enter `data` at the **Local directory** prompt and confirm.
+
+```sh
+mweave --config demo.json mount add /files
+mweave --config demo.json ls /files
+mweave --config demo.json get /files/sample.txt copy.txt
+```
+
+`/files` is the mounted address inside mweave. `ls` shows `sample.txt`, and
+`copy.txt` contains its bytes. Use a new output filename if `copy.txt` already
+exists. To connect cloud storage, use `mount add /cloud` and choose a route
+from [Storage sources](docs/sources.md#cloud-authorization).
+
+## Share the mount
+
+Save a password in a private file named `webdav-password.txt` beside
+`demo.json`, outside `data/`. In the export wizard choose WebDAV, `/files`,
+the default loopback listener `127.0.0.1:8787` and read-only access. Enter
+`reader` as the username and `file:webdav-password.txt` as the password
+reference. Leave the TLS certificate blank for this loopback example and
+confirm.
+
+```sh
+mweave --config demo.json export add
+mweave --config demo.json serve
+```
+
+After readiness, open `http://127.0.0.1:8787/sample.txt` in a WebDAV client
+with those credentials. It should return the sample bytes. Stop the server
+with Ctrl+C.
+
+## Configure and automate
+
+The default config is `%LOCALAPPDATA%\mweave\config.json` on Windows and
+`${XDG_CONFIG_HOME:-$HOME/.config}/mweave/config.json` on Linux. `--config`
+selects another JSON file. The configuration stores references to secrets.
+
+Use `mweave --config demo.json mount add --from mount.json` to load a
+[prepared record](docs/configuration.md#use-a-prepared-record). Add `--json`
+to commands that return structured [results](docs/specification.md#results-and-exit-status).
+
+- [Configuration and recovery](docs/configuration.md)
+- [Commands and protocol details](docs/specification.md)
+- [Architecture](docs/architecture.md) and [contributing](CONTRIBUTING.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

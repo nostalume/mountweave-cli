@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/browser"
@@ -28,12 +30,14 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, in io.Reader, out, prompts io.Writer) error {
+func run(ctx context.Context, args []string, in io.Reader, out, prompts io.Writer) (err error) {
 	flags := flag.NewFlagSet("mweave-browser-check", flag.ContinueOnError)
 	flags.SetOutput(prompts)
-	stage := flags.String("stage", "", "Observe only list, full, or range after reopening")
+	signIn := flags.Bool("signin", false, "Open the website sign-in window using the saved session")
+	fresh := flags.Bool("fresh", false, "Sign in with a disposable session")
+	withSample := flags.Bool("sample", false, "Generate a test file and check which download responses match it")
 	flags.Usage = func() {
-		fmt.Fprintln(prompts, "Usage: mweave-browser-check [-stage list|full|range] https://cloud.example/")
+		fmt.Fprintln(prompts, "Usage: mweave-browser-check [options] https://cloud.example/")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -42,51 +46,61 @@ func run(ctx context.Context, args []string, in io.Reader, out, prompts io.Write
 		}
 		return err
 	}
-	if flags.NArg() != 1 || (*stage != "" && *stage != "list" && *stage != "full" && *stage != "range") {
+	if flags.NArg() != 1 {
 		flags.Usage()
-		return errors.New("Provide a website and, optionally, one stage.")
+		return errors.New("Provide one website.")
 	}
 	entry, err := url.Parse(flags.Arg(0))
 	if err != nil || entry.Scheme != "https" || entry.Hostname() == "" || entry.User != nil ||
 		entry.RawQuery != "" || entry.ForceQuery {
 		return errors.New("Use a public HTTPS entry URL without credentials or query parameters.")
 	}
-	phases, checkErr := observeWebsite(ctx, entry, *stage, bufio.NewReader(in), prompts)
+	var sample *fileSample
+	if *withSample {
+		dir, tempErr := os.MkdirTemp("", "mweave-sample-")
+		if tempErr != nil {
+			return errors.New("Could not create a temporary sample directory.")
+		}
+		defer func() {
+			if os.RemoveAll(dir) != nil {
+				err = errors.Join(err, errors.New("Could not remove the local sample."))
+			}
+		}()
+		sample, err = createSample(filepath.Join(dir, filepath.Base(dir)+".zip"))
+		if err != nil {
+			return err
+		}
+	}
+	report, checkErr := observeWebsite(ctx, entry, *signIn, *fresh, sample, bufio.NewReader(in), prompts)
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
-	return errors.Join(checkErr, encoder.Encode(struct {
-		Phases []phaseReport `json:"phases"`
-	}{Phases: phases}))
+	return errors.Join(checkErr, encoder.Encode(report))
 }
 
-func observeWebsite(ctx context.Context, entry *url.URL, stage string, in *bufio.Reader, out io.Writer) (phases []phaseReport, err error) {
-	phases = make([]phaseReport, 0, 3)
+func observeWebsite(ctx context.Context, entry *url.URL, signIn, fresh bool, sample *fileSample, in *bufio.Reader, out io.Writer) (report browserReport, err error) {
+	report.Observations = []operationReport{}
 	binary, options := website.Browser()
 	if binary == "" {
-		return phases, errors.New("No compatible browser is available for an isolated website session.")
+		return report, errors.New("No compatible browser is available for an isolated website session.")
 	}
-	tmp, err := os.MkdirTemp("", "mweave-browser-check-")
+	profile, existed, releaseProfile, err := openProbeProfile(entry, fresh)
 	if err != nil {
-		return phases, errors.New("Could not create the isolated browser directory.")
+		return report, err
 	}
-	defer func() {
-		if os.RemoveAll(tmp) != nil {
-			err = errors.Join(err, errors.New("Could not remove the isolated browser directory."))
+	defer func() { err = errors.Join(err, releaseProfile()) }()
+	if !existed || signIn || fresh {
+		fmt.Fprintln(out, "Sign in to the website, then close the sign-in window.")
+		if err := website.SignIn(ctx, binary, profile, entry.String(), func() error {
+			return waitForEnter(ctx, in, out, "Press Enter after signing in and closing the window.")
+		}, out); err != nil {
+			return report, err
 		}
-	}()
-	profile := filepath.Join(tmp, "profile")
-	if err := website.PrivateDirectory(profile, true); err != nil {
-		return phases, errors.New("Could not protect the isolated browser profile.")
-	}
-	fmt.Fprintln(out, "Sign in in the isolated window, then close that window.")
-	if err := website.SignIn(ctx, binary, profile, entry.String(), func() error {
-		return waitForEnter(ctx, in, out, "Press Enter after signing in and closing the window.")
-	}, out); err != nil {
-		return phases, err
+	} else {
+		fmt.Fprintln(out, "Reopening the saved browser session. If the site asks you to sign in, rerun with -signin.")
 	}
 	tab, closeTab, err := website.Launch(ctx, binary, append(options, chromedp.VisibleWindow), profile)
 	if err != nil {
-		return phases, err
+		return report, err
 	}
 	defer func() { err = errors.Join(err, closeTab()) }()
 	life, cancel := context.WithCancel(tab)
@@ -96,50 +110,117 @@ func observeWebsite(ctx context.Context, entry *url.URL, stage string, in *bufio
 	if _, err := chromedp.CallBrowser(life, browser.SetDownloadBehavior, browser.SetDownloadBehaviorParams{
 		Behavior: browser.SetDownloadBehaviorBehaviorDeny,
 	}); err != nil {
-		return phases, errors.New("Could not disable local saving in the observation window.")
+		return report, errors.New("Could not disable local saving in the observation window.")
 	}
-	phase, err := capture(life, "reopen", entry, func() error {
+	opening, err := capture(life, entry, nil, func() (bool, error) {
 		navigation, done := context.WithTimeout(life, 15*time.Second)
 		defer done()
 		if _, err := chromedp.Run(navigation, chromedp.Navigate(entry.String())); err != nil {
-			return errors.New("Could not reopen the website.")
+			return false, errors.New("Could not reopen the website.")
 		}
-		return nil
+		return true, nil
 	})
-	phases = append(phases, phase)
+	report.Opening = &opening
 	if err != nil {
-		return phases, err
+		return report, err
 	}
-	for _, step := range []struct{ stage, prompt string }{
-		{"list", "Open a private folder and advance to the next page if available. Press Enter when finished."},
-		{"full", "Click Download on one small file. This window records the response without saving the file. Press Enter when the request ends."},
-		{"range", "Perform the website action that requests part of an existing file, then press Enter. If the site has no such action, press Enter to end the observation."},
-	} {
-		if stage != "" && stage != step.stage || stage == "" && step.stage == "range" {
-			continue
-		}
-		phase, err := capture(life, step.stage, entry, func() error { return waitForEnter(life, in, out, step.prompt) })
-		phases = append(phases, phase)
+	if sample != nil {
+		fmt.Fprintf(out, "Upload the generated test file, then press Enter.\n  %s\n"+
+			"Click Download for that file and press Enter again. Remove the uploaded test file when finished.\n", sample.path)
+	}
+	report.Observations, err = observeOperations(life, in, out, sample != nil, func(work func() (bool, error)) (networkReport, error) {
+		return capture(life, entry, sample, work)
+	})
+	return report, err
+}
+
+const operationLabels = "list details search download upload rename move delete other"
+const visibleResults = "browser preview client membership denied unknown"
+
+var (
+	operations = strings.Fields(operationLabels)
+	results    = strings.Fields(visibleResults)
+)
+
+func observeOperations(ctx context.Context, in *bufio.Reader, out io.Writer, checkSample bool, captureWindow func(func() (bool, error)) (networkReport, error)) ([]operationReport, error) {
+	observations := []operationReport{}
+	if _, err := fmt.Fprintln(out, "Use files you own. For changes, use a disposable file. The observation window blocks saving downloads.\n"+
+		"Optional annotation example: delete denied."); err != nil {
+		return observations, err
+	}
+	for {
+		var observation operationReport
+		var done bool
+		evidence, err := captureWindow(func() (bool, error) {
+			var err error
+			observation, done, err = readObservation(ctx, in, out, len(observations)+1)
+			return !done, err
+		})
 		if err != nil {
-			return phases, err
+			return observations, err
+		}
+		if done {
+			return observations, nil
+		}
+		observation.networkReport = evidence
+		observations = append(observations, observation)
+		if checkSample {
+			if err := printSampleCheck(out, len(observations), evidence.Requests); err != nil {
+				return observations, err
+			}
 		}
 	}
-	return phases, nil
 }
 
 func waitForEnter(ctx context.Context, in *bufio.Reader, out io.Writer, prompt string) error {
-	if _, err := fmt.Fprintln(out, prompt); err != nil {
-		return err
+	_, err := promptLine(ctx, in, out, prompt)
+	return err
+}
+
+func readObservation(ctx context.Context, in *bufio.Reader, out io.Writer, number int) (operationReport, bool, error) {
+	prompt := fmt.Sprintf("Observation %d. Perform an action, then press Enter to mark it. Type q and press Enter to finish.", number)
+	for {
+		answer, err := promptLine(ctx, in, out, prompt)
+		if err != nil {
+			return operationReport{}, false, err
+		}
+		if strings.TrimSpace(answer) == "q" {
+			return operationReport{}, true, nil
+		}
+		fields := strings.Fields(strings.ToLower(answer))
+		if len(fields) == 0 {
+			return operationReport{}, false, nil
+		}
+		if len(fields) <= 2 && slices.Contains(operations, fields[0]) {
+			if len(fields) == 1 {
+				return operationReport{Operation: fields[0]}, false, nil
+			}
+			if slices.Contains(results, fields[1]) {
+				return operationReport{Operation: fields[0], ReportedResult: fields[1]}, false, nil
+			}
+		}
+		prompt = "Press Enter to mark, or type q and press Enter to finish.\n" +
+			"Operations [" + operationLabels + "]\nOptional result [" + visibleResults + "]"
 	}
-	done := make(chan error, 1)
+}
+
+func promptLine(ctx context.Context, in *bufio.Reader, out io.Writer, prompt string) (string, error) {
+	if _, err := fmt.Fprintln(out, prompt); err != nil {
+		return "", err
+	}
+	type answer struct {
+		line string
+		err  error
+	}
+	done := make(chan answer, 1)
 	go func() {
-		_, err := in.ReadSlice('\n')
-		done <- err
+		line, err := in.ReadSlice('\n')
+		done <- answer{line: string(line), err: err}
 	}()
 	select {
-	case err := <-done:
-		return err
+	case answer := <-done:
+		return answer.line, answer.err
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	}
 }
