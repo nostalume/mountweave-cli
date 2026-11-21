@@ -55,7 +55,8 @@ func PrivateDirectory(path string, create bool) error {
 	if err != nil {
 		return err
 	}
-	sddl := "D:P(A;OICI;FA;;;" + user.User.Sid.String() + ")(A;OICI;FA;;;SY)"
+	sid := user.User.Sid.String()
+	sddl := "O:" + sid + "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;SY)"
 	expected, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err

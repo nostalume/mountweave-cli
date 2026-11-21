@@ -37,7 +37,10 @@ func (d countedDriver) Close() error {
 }
 
 func TestSelectedHost(t *testing.T) {
-	base := t.TempDir()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	config := filepath.Join(base, "settings.json")
 	root := filepath.Join(base, "data")
 	stage := filepath.Join(base, "staging")
