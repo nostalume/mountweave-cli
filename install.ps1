@@ -21,8 +21,13 @@ if (!$BinDir) { throw '-BinDir needs a directory.' }
 $BinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BinDir)
 
 if (!$PSBoundParameters.ContainsKey('Version')) {
-    $latest = Invoke-RestMethod -Uri 'https://api.github.com/repos/nostalume/mountweave-cli/releases/latest'
-    $Version = $latest.tag_name
+    $response = (Invoke-WebRequest -UseBasicParsing -Method Head -Uri "$repo/releases/latest").BaseResponse
+    $release = if ($PSVersionTable.PSEdition -eq 'Desktop') { $response.ResponseUri } else { $response.RequestMessage.RequestUri }
+    $tagPrefix = "$repo/releases/tag/"
+    if (!$release.AbsoluteUri.StartsWith($tagPrefix, [StringComparison]::Ordinal)) {
+        throw 'No stable release found. Pass a release tag with -Version.'
+    }
+    $Version = $release.AbsoluteUri.Substring($tagPrefix.Length)
 }
 if ($Version -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?\z') {
     throw 'Expected a release tag such as v0.1.0.'
