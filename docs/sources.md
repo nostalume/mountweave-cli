@@ -20,10 +20,10 @@ Choose a route based on what you already have.
 
 | What you have | Route and what to prepare |
 | --- | --- |
-| An ordinary account | Use website sign-in for [Aliyun Drive](#connect-aliyun-drive-through-the-website), [LanZou, Mobile Cloud, UC or Quark](#browser-based-file-access), or account consent for [Weiyun](#connect-tencent-weiyun). The wizard keeps the resulting authorization. |
+| An ordinary account | Use website sign-in for [123 Cloud Drive](#connect-123-cloud-drive), [Aliyun Drive](#connect-aliyun-drive-through-the-website), [LanZou, Mobile Cloud, UC or Quark](#browser-based-file-access), or account consent for [Weiyun](#connect-tencent-weiyun). The wizard keeps the resulting authorization. |
 | Server or app credentials | Use [WebDAV presets](#webdav-presets) for Nutstore, 123 WebDAV or FEB. For WebDAV, SFTP, FTP and SMB, get the address and sign-in details from the service or server administrator. |
 | An approved or configured application | Get application settings before setup for [Aliyun Drive Open](#connect-aliyun-drive-open), [115 Open](#connect-115-open), [123 Open](#connect-123-open), [Dropbox](#connect-dropbox), [Google Drive](#connect-google-drive) or [Microsoft Graph](#connect-microsoft-graph). The provider may require an eligible account or administrator consent. |
-| A provider token or API key | Use `reference` where offered. Obtain a credential for the selected account or space with the permissions you need. See [drive and team integrations](#drive-and-team-integrations) for service-specific inputs. |
+| A provider token or API key | Use `reference` where offered. For a personal [PikPak](#connect-pikpak) drive, create a read-only access token. See [drive and team integrations](#drive-and-team-integrations) for other service-specific inputs. |
 | An S3 bucket and credentials | Use [S3-compatible storage](#s3-compatible-storage) with credentials issued for that bucket, normally through the AWS SDK credential chain or a named profile. |
 
 Run `mweave mount add /cloud`, choose the service and complete its sign-in or
@@ -315,6 +315,14 @@ configuration before replacing the grant. If refresh cannot be confirmed or
 115 rejects the token before its local expiry, reauthorize in `mount edit`.
 [115 Open refresh contract](https://open.115.com/doc/115开放平台/接入指南/接入授权/刷新access_token.md?raw=true)
 
+## Connect 123 Cloud Drive
+
+Choose `pan123` → `website` in `mweave mount add /cloud`. Sign in in the
+dedicated browser window, close it when your files appear, and choose a
+folder. The wizard saves the verified account and folder. Use `ls` to browse
+and `get` to read files for which the service offers ordinary downloads.
+The connection is read-only. To renew an expired sign-in, use `mount edit`.
+
 ## Connect 123 Open
 
 Choose `pan123` → `open` if you have a Client ID and Client Secret issued
@@ -328,6 +336,19 @@ in the selected configuration sharing that grant. Choose `switch` to
 bind only the selected mount to another account.
 [123 Open application setup](https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/hpengmyg32blkbg8) ·
 [Token issuance](https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/gn1nai4x0v0ry9ki)
+
+## Connect PikPak
+
+In PikPak, open **Account & Security → Connected Apps** and create a Personal
+Access Token with **Read files** permission. Choose `pikpak` in
+`mweave mount add /cloud` and provide a [credential reference](configuration.md#configuration-and-secrets).
+Leave the folder ID empty to use the account root. The wizard generates a
+device ID and saves it with the mount.
+
+PikPak supports browsing, full downloads and single byte ranges. If the host
+needs a network proxy, set `HTTPS_PROXY` and `HTTP_PROXY` for the mweave
+process. The API uses HTTPS and the temporary file address can use HTTP.
+[PikPak permissions and network guidance](https://mypikpak.com/en-US/faq)
 
 ## Connect Microsoft Graph
 
@@ -411,7 +432,8 @@ The installed binary lists available IDs in `mweave mount add --help`.
 | `webdav` | `root_url` selects the collection. Set `username` and a credential reference for Basic authentication, or omit both for anonymous access. |
 | `nutstore`, `febbox` | Use the provider's WebDAV username and app password. See [WebDAV presets](#webdav-presets). |
 | `pan115` | Use [phone scan authorization](#connect-115-open) or reference an existing access token. Select a folder with `root_path` or `root_id`, or omit both for the account root. |
-| `pan123` | Use [application credentials](#connect-123-open) or reference an existing access token. Select a folder with `root_path` or `root_id`, or omit both for the account root. |
+| `pan123` | Choose [website sign-in](#connect-123-cloud-drive) in the wizard, or use [Open API credentials](#connect-123-open). Open API accepts `root_path` or `root_id`, or both omitted for the account root. |
+| `pikpak` | Reference a [read-only personal access token](#connect-pikpak). The wizard generates `device_id`. Optional `root_id` selects a native folder. |
 | `baidupan` | Set `root_path` to an explicit absolute directory covered by your Baidu Netdisk authorization. Reference an existing access token. |
 | `graphdrive` | Set a known `drive_id` and a drive-relative `root_path` or `root_id`. Use `/` for the drive root. Choose [device authorization](#connect-microsoft-graph) for global Microsoft Graph, or reference an existing access token for the selected endpoint. |
 | `googledrive` | Use [browser authorization](#connect-google-drive) or reference an existing Drive access token. Set `root_id` or `root_path`, or omit both for the authorized root. Use a folder ID for a shared drive or one of its folders. |

@@ -68,7 +68,9 @@ func TestDefaultConnections(t *testing.T) {
 		id, connection, options, origin, location string
 	}{
 		{"pan123", "", `{"root_id":"42"}`, "Authorization https://open-api.123pan.com", "Folder ID 42"},
+		{"pan123", "website", `{"root":"/"}`, "https://yun.123pan.cn/", ""},
 		{"pan123", "webdav", `{"root_url":"https://example.test/webdav/","username":"reader"}`, "webdav https example.test 443", "https://example.test/webdav/"},
+		{"pikpak", "", `{"device_id":"0123456789abcdef0123456789abcdef"}`, "Authorization https://api-drive.mypikpak.com", ""},
 		{"alipan-web", "", `{"account":"fixture","drive_id":"resource","root_id":"root"}`, "https://www.alipan.com/drive", ""},
 		{"githubrepo", "", `{"repository":"example/tree","ref":"main"}`, "Authorization https://api.github.com", ""},
 		{"atomgit", "", `{"repository":"example/tree","ref":"main"}`, "Authorization https://api.atomgit.com", ""},

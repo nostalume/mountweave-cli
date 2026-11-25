@@ -43,16 +43,16 @@ type websiteSession struct {
 }
 
 type websiteSource struct {
-	ID, Name, Entry string
-	SignIn          error
-	BindingMismatch error
-	Open            func(context.Context, string, []chromedp.ExecAllocatorOption, string) (websiteSession, error)
+	ID, Connection, Name, Entry string
+	SignIn                      error
+	BindingMismatch             error
+	Open                        func(context.Context, string, []chromedp.ExecAllocatorOption, string) (websiteSession, error)
 }
 
 func (s websiteSource) route() cliapp.Route {
 	r := cliapp.SourceRoute(nil, s.prepare)
 	r.SignIn, r.SignInProblem, r.BindingMismatch = s.SignIn, websiteSignInProblem(s.Name), s.BindingMismatch
-	return attachWebsiteSetup(r, websiteLogin{Driver: s.ID, Name: s.Name, Entry: s.Entry}, s.restore, s.verify)
+	return attachWebsiteSetup(r, websiteLogin{Driver: s.ID, Connection: s.Connection, Name: s.Name, Entry: s.Entry}, s.restore, s.verify)
 }
 
 func (s websiteSource) prepare(options websiteMountOptions, _ string) (cliapp.MountSource, error) {
