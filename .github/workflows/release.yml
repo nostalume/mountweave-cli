@@ -73,7 +73,7 @@ jobs:
           $output = Join-Path $env:RUNNER_TEMP archives
           New-Item -ItemType Directory $stage, $output | Out-Null
           $binary = Join-Path $stage $env:PACKAGE_BINARY
-          go build -mod=readonly -buildvcs=true -trimpath -o $binary .
+          go build -mod=readonly -buildvcs=true -trimpath -ldflags '-s -w' -o $binary .
           $revision = git rev-parse HEAD
           $metadata = (go version -m $binary) -join [Environment]::NewLine
           if ($metadata -notmatch "(?m)^\s*build\s+vcs\.revision=$revision\s*$" -or
@@ -102,9 +102,9 @@ jobs:
           }
           $archive = Join-Path $output "mweave_$($env:GITHUB_REF_NAME)_$target.$($env:PACKAGE_EXTENSION)"
           if ($IsWindows) {
-            Compress-Archive -LiteralPath $binary, (Join-Path $stage LICENSE), $licenses -DestinationPath $archive
+            [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, [IO.Compression.CompressionLevel]::SmallestSize, $false)
           } else {
-            tar -czf $archive -C $stage -- $env:PACKAGE_BINARY LICENSE licenses
+            tar -I 'gzip -9' -cf $archive -C $stage -- $env:PACKAGE_BINARY LICENSE licenses
           }
           "MWEAVE_ARCHIVE=$archive" >> $env:GITHUB_ENV
       - name: Smoke test the archive
