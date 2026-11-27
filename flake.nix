@@ -9,11 +9,11 @@
       pkgs = nixpkgs.legacyPackages.${system};
       mweave = pkgs.stdenvNoCC.mkDerivation rec {
         pname = "mweave";
-        version = "0.2.1";
+        version = "0.3.0";
 
         src = pkgs.fetchurl {
           url = "https://github.com/nostalume/mountweave-cli/releases/download/v${version}/mweave_v${version}_linux_amd64.tar.gz";
-          hash = "sha256-NqwEUhQn3KcXLAvKTbcNJL/oUQ8ib7L6Q7pYTYjio8U=";
+          hash = "sha256-F9nL3Ed5gmhgveE9jGjmK708/MYrnXEIj/c1s1kbc/0=";
         };
 
         sourceRoot = ".";
