@@ -14,7 +14,10 @@ var builtinSources = func() []cliapp.Source {
 	aliWebsite := aliPanWebsiteRoute()
 	aliOpen := cliapp.SourceRoute(guideAliPan, prepareAliPan).WithManaged(aliPanAuthorization)
 	dav123 := dav.Route.WithReview("123 WebDAV")
-	open123 := cliapp.SourceRoute(guideAccountFolder, prepare123).WithManaged(pan123Authorization).WithReview("123 Open")
+	baiduOpen := cliapp.SourceRoute(guideBaidu, prepareBaidu).WithReview("Baidu Open")
+	open123 := cliapp.SourceRoute(guide123, prepare123).WithManaged(pan123Authorization).WithReview("123 Open")
+	open115 := cliapp.SourceRoute(guideAccountFolder, prepare115).WithManaged(pan115Authorization).WithReview("115 Open")
+	guangyaOpen := cliapp.SourceRoute(guideGuangya, prepareGuangya).WithReview("Guangya Pan Open")
 	return []cliapp.Source{
 		localsource.Source(),
 		webdav,
@@ -40,7 +43,9 @@ var builtinSources = func() []cliapp.Source {
 		cliapp.SingleSource(cliapp.PoolSourceID, "Private storage pool", poolRoute()),
 		cliapp.SingleSource("atomgit", "AtomGit repository tree", cliapp.SourceRoute(guideRepositoryTree, prepareAtomGit)),
 		cliapp.SingleSource("azureblob", "Azure Blob container", cliapp.SourceRoute(guideAzure, prepareAzure)),
-		cliapp.SingleSource("baidupan", "Baidu Netdisk", cliapp.SourceRoute(guideBaidu, prepareBaidu)),
+		cliapp.ServiceSource("baidupan", "Baidu Netdisk",
+			cliapp.SourceConnection{Method: "website", Route: baiduWebsiteRoute(), Label: "Website sign-in (browse and download when offered by the website)"},
+			cliapp.SourceConnection{Method: "open", Route: &baiduOpen, Label: "Open API with an access token"}),
 		cliapp.SingleSource("box", "Box folder", cliapp.SourceRoute(guideBox, prepareBox)),
 		cliapp.SingleSource("bunny", "Bunny Storage zone", cliapp.SourceRoute(guideBunny, prepareBunny)),
 		cliapp.SingleSource("cnbreleases", "CNB release assets", cliapp.SourceRoute(guideCNBRelease, prepareCNBRelease)),
@@ -56,19 +61,28 @@ var builtinSources = func() []cliapp.Source {
 		cliapp.SingleSource("githubreleases", "GitHub release assets", cliapp.SourceRoute(guideGitHubRelease, prepareGitHubRelease)),
 		cliapp.SingleSource("gokuai", "Gokuai enterprise library", cliapp.SourceRoute(guideGokuai, prepareGokuai)),
 		cliapp.SingleSource("graphdrive", "Microsoft Graph drive", cliapp.SourceRoute(guideGraphDrive, prepareGraphDrive).WithManaged(graphAuthorization)),
-		cliapp.SingleSource("guangyapan", "Guangya Pan Open folder", cliapp.SourceRoute(guideGuangya, prepareGuangya)),
+		cliapp.ServiceSource("guangyapan", "Guangya Pan (光鸭云盘)",
+			cliapp.SourceConnection{Method: "website", Route: guangyaWebsiteRoute(), Label: "Website sign-in (browse and download)"},
+			cliapp.SourceConnection{Method: "open", Route: &guangyaOpen, Label: "Open API with an approved application"}),
 		cliapp.SingleSource("ipfs", "IPFS directory via Kubo", cliapp.SourceRoute(guideIPFS, prepareIPFS)),
 		cliapp.SingleSource("kdocs", "KDocs personal folder", cliapp.SourceRoute(guideKDocs, prepareKDocs)),
-		cliapp.SingleSource("pan115", "115 Open cloud drive", cliapp.SourceRoute(guideAccountFolder, prepare115).WithManaged(pan115Authorization)),
-		cliapp.ServiceSource("pikpak", "PikPak", cliapp.SourceConnection{Route: pikPakRoute(),
-			SetupURL:  "https://mypikpak.com/",
-			SetupHint: "In PikPak, open Account & Security > Connected Apps and create a Personal Access Token with Read files permission."}),
+		cliapp.ServiceSource("mediafire", "MediaFire",
+			cliapp.SourceConnection{Method: "website", Route: mediaFireWebsiteRoute(), Label: "Website sign-in (browse, download, upload and create directories)"}),
+		cliapp.ServiceSource("pan115", "115 Cloud Drive (115网盘)",
+			cliapp.SourceConnection{Method: "website", Route: pan115WebsiteRoute(), Label: "Website sign-in (browse and download)"},
+			cliapp.SourceConnection{Method: "open", Route: &open115, Label: "Open API"}),
+		cliapp.ServiceSource("pikpak", "PikPak",
+			cliapp.SourceConnection{Route: pikPakRoute(),
+				SetupURL:  "https://mypikpak.com/",
+				SetupHint: "In PikPak, open Account & Security > Connected Apps and create a Personal Access Token with Read files permission."}),
 		cliapp.SingleSource("s3", "S3-compatible object storage", cliapp.SourceRoute(guideS3, prepareS3)),
 		cliapp.SingleSource("seafile", "Seafile library", cliapp.SourceRoute(guideSeafile, prepareSeafile)),
 		cliapp.SingleSource("sftp", "SFTP directory", cliapp.SourceRoute(guideSFTP, prepareSFTP)),
 		cliapp.SingleSource("smb", "SMB share", cliapp.SourceRoute(guideSMB, prepareSMB)),
 		cliapp.SingleSource("tencentdocs", "Tencent Docs folder", cliapp.SourceRoute(guideTencentDocs, prepareTencentDocs)),
 		cliapp.SingleSource("tencentsmh", "Tencent Cloud SMH space", cliapp.SourceRoute(guideTencentSMH, prepareTencentSMH)),
+		cliapp.ServiceSource("tianyipan", "Tianyi Cloud Drive (天翼云盘)",
+			cliapp.SourceConnection{Method: "website", Route: tianyiWebsiteRoute(), Label: "Personal website sign-in"}),
 		cliapp.SingleSource("upyun", "UPYUN USS bucket", cliapp.SourceRoute(guideUPYUN, prepareUPYUN)),
 		cliapp.SingleSource("wecomdrive", "WeCom Wedrive folder", cliapp.SourceRoute(guideWeComDrive, prepareWeComDrive)),
 		cliapp.SingleSource("weiyun", "Tencent Weiyun (腾讯微云)", cliapp.SourceRoute(guideWeiyun, prepareWeiyun).WithManaged(weiyunAuthorization)),

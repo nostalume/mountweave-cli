@@ -84,18 +84,36 @@ func checkGrantDirectory(dir string) error {
 	return nil
 }
 
-func MissingGrant(id string) (bool, error) {
+func grantPath(id string) (string, error) {
 	if !ManagedStoreSupported || !ValidGrantID(id) {
-		return false, GrantUnavailable()
+		return "", GrantUnavailable()
 	}
 	dir, err := GrantDirectory(false)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, id+".grant"), nil
+}
+
+func MissingGrant(id string) (bool, error) {
+	path, err := grantPath(id)
 	if err == nil {
-		err = checkGrantFile(filepath.Join(dir, id+".grant"))
+		err = checkGrantFile(path)
 	}
 	if err == missingManagedGrant {
 		return true, nil
 	}
 	return false, err
+}
+
+// InspectGrant reads the current record without acquiring a lease.
+// The caller owns the sensitive result. Use a lease for credential updates.
+func InspectGrant(id string) ([]byte, error) {
+	path, err := grantPath(id)
+	if err != nil {
+		return nil, err
+	}
+	return ReadGrant(path)
 }
 
 func AcquireGrant(id string, create bool) (*GrantLease, error) {
@@ -135,7 +153,15 @@ func GrantUnavailable() error {
 	return &Problem{Code: "credential_unavailable", Message: "The managed authorization record is unavailable.", NextAction: "Check the protected credential store for this user."}
 }
 
-var missingManagedGrant = &Problem{Code: "credential_unavailable", Message: "The saved authorization is missing on this machine.", Reconnect: true}
+var (
+	missingManagedGrant   = &Problem{Code: "credential_unavailable", Message: "The saved authorization is missing on this machine.", Reconnect: true}
+	grantDecryptionFailed = &Problem{Code: "credential_unavailable", Message: "The saved authorization could not be decrypted.", Reconnect: true}
+)
+
+// MayReconnectGrant reports that a new authorization can replace the old reference.
+func MayReconnectGrant(err error) bool {
+	return errors.Is(err, missingManagedGrant) || errors.Is(err, grantDecryptionFailed)
+}
 
 func (g *GrantLease) Read() ([]byte, error) { return ReadGrant(g.Path) }
 
@@ -167,25 +193,22 @@ func ReadGrant(path string) ([]byte, error) {
 	}
 	plain, err := unprotectGrant(data)
 	if err != nil {
-		return nil, GrantUnavailable()
+		return nil, grantDecryptionFailed
 	}
 	return plain, nil
 }
 
 // Save reports whether the new grant became visible. The error also reports
 // failed durability checks after publication.
-func (g *GrantLease) Save(ctx context.Context, data []byte, replace bool) (published bool, err error) {
+func (g *GrantLease) Save(ctx context.Context, data []byte, replace bool) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	info, err := os.Lstat(g.Path)
 	switch {
-	case err == nil && (!replace || !info.Mode().IsRegular() || !privateGrantFile(info, 0600)):
-		return false, GrantUnavailable()
-	case err != nil && (replace || !errors.Is(err, fs.ErrNotExist)):
-		return false, GrantUnavailable()
-	}
-	if len(data) > maxGrantBytes {
+	case len(data) > maxGrantBytes,
+		err == nil && (!replace || !info.Mode().IsRegular() || !privateGrantFile(info, 0600)),
+		err != nil && (replace || !errors.Is(err, fs.ErrNotExist)):
 		return false, GrantUnavailable()
 	}
 	protected, err := protectGrant(data)
@@ -195,15 +218,9 @@ func (g *GrantLease) Save(ctx context.Context, data []byte, replace bool) (publi
 	if len(protected) > maxGrantBytes {
 		return false, GrantUnavailable()
 	}
-	stage, err := stageFile(filepath.Dir(g.Path), ".grant-*", protected)
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(stage)
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	return publishGrant(stage, g.Path, replace)
+	return publishStagedFile(ctx, g.Path, ".grant-*", protected, func(stage string) (bool, error) {
+		return publishGrant(stage, g.Path, replace)
+	})
 }
 
 func ReadCredentialFile(name string) ([]byte, error) {
@@ -265,17 +282,21 @@ func sameReference(a, b *CredentialRef, base string) bool {
 
 // Check shared references before reading a secret or sending a probe. Edits
 // include the old record so a destination change cannot reuse its reference.
-func CheckAudience(app *App, m MountRecord, src MountSource, saved ConfigSnapshot, sources iter.Seq[MountRecord]) error {
-	if err := src.references().check(m.Credential); err != nil {
-		return err
+func admitMount(app *App, m MountRecord, src MountSource, saved ConfigSnapshot, sources iter.Seq[MountRecord]) (sourceOpener, error) {
+	open, err := src.references().opener(m.Credential)
+	if err != nil {
+		return nil, err
+	}
+	if open == nil && (src.pool == nil || src.Route == nil || src.Route.pool == nil) {
+		return nil, unavailableSource()
 	}
 	if m.Credential == nil {
-		return nil
+		return open, nil
 	}
 	base := filepath.Dir(saved.Path)
 	for _, e := range saved.Value.Exports {
 		if sameReference(m.Credential, e.Auth.Credential, base) {
-			return exportCredentialConflict()
+			return nil, exportCredentialConflict()
 		}
 	}
 	fromRecord := src.preparedOptions != nil && bytes.Equal(src.preparedOptions, m.Options)
@@ -288,8 +309,8 @@ func CheckAudience(app *App, m MountRecord, src MountSource, saved ConfigSnapsho
 		}
 		old, err := PrepareMountSource(app, prior, base)
 		if err != nil || old.Audience != src.Audience {
-			return &Problem{Code: "credential_scope_conflict", Message: "This credential reference is already associated with a different or unknown destination.", NextAction: "Provide a separate credential reference for the new destination."}
+			return nil, &Problem{Code: "credential_scope_conflict", Message: "This credential reference is already associated with a different or unknown destination.", NextAction: "Provide a separate credential reference for the new destination."}
 		}
 	}
-	return nil
+	return open, nil
 }

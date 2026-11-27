@@ -19,7 +19,7 @@ import (
 
 // websiteLogin describes the browser entry and how the source identifies its saved grant.
 type websiteLogin struct {
-	Driver, Connection, Name, Entry, Instructions string
+	Name, Entry, Instructions, Access string
 	// ReplaceReference leaves the old grant and profile in place when replacing a mount.
 	ReplaceReference bool
 	// SeparateGrantID lets multiple roots share a grant whose profile can change.
@@ -53,7 +53,23 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 	restore func(O, func() ([]byte, error)) (websiteBinding[T], error),
 	verify func(context.Context, *websiteCandidate, T) (websiteSelection, error),
 ) cliapp.Route {
-	route.Setup = func(ctx context.Context, saved cliapp.ConfigSnapshot, prior cliapp.MountRecord, at string, ask cliapp.Prompt, out io.Writer) (receipt cliapp.MountReceipt, _ string, err error) {
+	route.InspectWebsite = func(id string, raw json.RawMessage, read func() ([]byte, error)) error {
+		var options O
+		if err := cliapp.DecodeObject(raw, &options); err != nil {
+			return err
+		}
+		if read == nil {
+			return cliapp.GrantUnavailable()
+		}
+		binding, err := restore(options, read)
+		if err != nil {
+			return err
+		}
+		_, err = websiteProfile(cmp.Or(binding.Profile, id), false)
+		return err
+	}
+	route.Setup = func(ctx context.Context, saved cliapp.ConfigSnapshot, prior, record cliapp.MountRecord, ask cliapp.Prompt, out io.Writer) (receipt cliapp.MountReceipt, _ string, err error) {
+		at := record.At
 		unchanged := cliapp.MountReceipt{At: at, Effect: core.Unchanged.String()}
 		if !cliapp.ManagedStoreSupported {
 			return unchanged, "", cliapp.GrantUnavailable()
@@ -75,7 +91,7 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 				return unchanged, "", err
 			}
 			old, err = existingGrant(prior.Credential)
-			if err != nil {
+			if err != nil && !cliapp.MayReconnectGrant(err) {
 				return unchanged, "", err
 			}
 			var read func() ([]byte, error)
@@ -84,9 +100,14 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 			}
 			binding, err = restore(options, read)
 			if old != nil {
-				if login.ReplaceReference {
-					err = errors.Join(err, old.Lock.Close())
+				if recoverGrant := cliapp.MayReconnectGrant(err); login.ReplaceReference || recoverGrant {
+					closeErr := old.Lock.Close()
 					old = nil
+					if recoverGrant {
+						// A fresh reference leaves the unreadable grant and its other mounts intact.
+						binding, err = restore(options, nil)
+					}
+					err = errors.Join(err, closeErr)
 				} else {
 					defer func() { err = errors.Join(err, old.Lock.Close()) }()
 				}
@@ -101,6 +122,7 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 			return unchanged, "", err
 		}
 		defer func() {
+			err = errors.Join(err, candidate.close())
 			if receipt.Effect != core.Applied.String() {
 				err = errors.Join(err, removeProfile(candidate.Profile))
 			}
@@ -114,22 +136,21 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 		}
 		if old != nil {
 			candidate.Shared = func(yield func(cliapp.MountRecord) bool) {
-				for m := range cliapp.SourceRecords(saved.Value.Mounts...) {
-					if m.Credential != nil && *m.Credential == *prior.Credential && !yield(m) {
+				for m := range cliapp.CredentialRecords(saved.Value.Mounts) {
+					if *m.Credential == *prior.Credential && !yield(m) {
 						return
 					}
 				}
 			}
 		}
-		defer func() { err = errors.Join(err, closeCandidate(&candidate.Release)) }()
 		selected, err := verify(ctx, &candidate, binding.Native)
 		if err != nil {
 			return unchanged, "", err
 		}
-		if err := confirmWebsiteMount(ask, out, prior, at, selected.Folder, selected.Account, binding.Verified); err != nil {
+		if err := confirmWebsiteMount(ask, out, prior, at, selected.Folder, selected.Account, cmp.Or(binding.Access, login.Access, websiteReadAccess), binding.Verified); err != nil {
 			return unchanged, "", err
 		}
-		if err := closeCandidate(&candidate.Release); err != nil {
+		if err := candidate.close(); err != nil {
 			return unchanged, "", err
 		}
 		data, err := json.Marshal(selected.Grant)
@@ -144,11 +165,7 @@ func attachWebsiteSetup[O, T any](route cliapp.Route, login websiteLogin,
 		if login.SeparateGrantID {
 			id = cliapp.NewGrantID()
 		}
-		record := cliapp.MountRecord{At: at, Driver: login.Driver, Connection: login.Connection,
-			Credential: &cliapp.CredentialRef{Kind: cliapp.ManagedCredential, Ref: id}}
-		if prior.Driver != "" {
-			record.Driver, record.Connection = prior.Driver, prior.Connection
-		}
+		record.Credential = &cliapp.CredentialRef{Kind: cliapp.ManagedCredential, Ref: id}
 		record.Options, err = json.Marshal(selected.Options)
 		if err != nil {
 			return unchanged, "", err
@@ -195,13 +212,13 @@ const (
 func (login websiteLogin) show(out io.Writer, at, folder, access string) error {
 	message := fmt.Sprintf("Sign in to %s. %s\n", login.Name, cmp.Or(login.Instructions, closeWebsiteSignIn))
 	if at != "" {
-		message = fmt.Sprintf("Reconnect %q to %s\n  Folder   %q\n  Access   %s\n\n%s", at, login.Name, folder, cmp.Or(access, websiteReadAccess), message)
+		message = fmt.Sprintf("Reconnect %q to %s\n  Folder   %q\n  Access   %s\n\n%s", at, login.Name, folder, cmp.Or(access, login.Access, websiteReadAccess), message)
 	}
 	_, err := io.WriteString(out, message)
 	return err
 }
 
-func confirmWebsiteMount(ask cliapp.Prompt, out io.Writer, prior cliapp.MountRecord, at, folder, account string, bindingVerified bool) error {
+func confirmWebsiteMount(ask cliapp.Prompt, out io.Writer, prior cliapp.MountRecord, at, folder, account, access string, bindingVerified bool) error {
 	if prior.Driver != "" {
 		if bindingVerified {
 			return nil
@@ -212,12 +229,12 @@ func confirmWebsiteMount(ask cliapp.Prompt, out io.Writer, prior cliapp.MountRec
 	if account != "" {
 		review += fmt.Sprintf("  Account  %q\n", account)
 	}
-	return cliapp.Confirm(ask, fmt.Sprintf("%s  Folder   %q\n  Mount    %q\n  Access   %s\nSave mount?", review, folder, at, websiteReadAccess))
+	return cliapp.Confirm(ask, fmt.Sprintf("%s  Folder   %q\n  Mount    %q\n  Access   %s\nSave mount?", review, folder, at, access))
 }
 
-func closeCandidate(release *func() error) error {
-	if close := *release; close != nil {
-		*release = nil
+func (c *websiteCandidate) close() error {
+	if close := c.Release; close != nil {
+		c.Release = nil
 		return close()
 	}
 	return nil
@@ -255,6 +272,11 @@ func websiteProfileRoot(grants string) string {
 	return filepath.Join(grants, "website")
 }
 
+var missingWebsiteProfile = &cliapp.Problem{
+	Code: "interaction_required", Message: "The saved browser session is missing on this machine.",
+	NextAction: "Sign in again.", Reconnect: true,
+}
+
 func websiteProfile(id string, create bool) (string, error) {
 	if !cliapp.ValidGrantID(id) {
 		return "", cliapp.GrantUnavailable()
@@ -267,6 +289,9 @@ func websiteProfile(id string, create bool) (string, error) {
 	profile := filepath.Join(root, id)
 	for _, path := range []string{root, profile} {
 		if err := website.PrivateDirectory(path, create); err != nil {
+			if !create && errors.Is(err, os.ErrNotExist) {
+				return "", missingWebsiteProfile
+			}
 			return "", cliapp.GrantUnavailable()
 		}
 	}
@@ -299,10 +324,8 @@ func replaceGrant(ctx context.Context, saved cliapp.ConfigSnapshot, at string, l
 	dir, err := websiteProfile(oldProfile, false)
 	if err == nil {
 		err = removeProfile(dir)
-	} else if grants, dirErr := cliapp.GrantDirectory(false); dirErr == nil {
-		if _, statErr := os.Lstat(filepath.Join(websiteProfileRoot(grants), oldProfile)); errors.Is(statErr, os.ErrNotExist) {
-			err = nil
-		}
+	} else if errors.Is(err, missingWebsiteProfile) {
+		err = nil
 	}
 	return receipt, fmt.Sprintf("Signed in again for %q.\n", at), err
 }

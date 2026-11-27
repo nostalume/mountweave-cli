@@ -8,7 +8,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -29,38 +28,37 @@ func passwordMatches(username, password string) func(string, string) bool {
 	}
 }
 
-func directoryHTTPHandler(c *core.Core, e Export, principal core.Principal, secret string) (http.Handler, func(context.Context) error, error) {
-	const cursorTTL = time.Minute
-	if e.Protocol == "http" {
-		token := strings.TrimRight(secret, "=")
-		if token == "" || strings.ContainsFunc(token, func(r rune) bool {
-			return !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || strings.ContainsRune("-._~+/", r))
-		}) {
-			return nil, nil, InvalidConfig("The JSON HTTP credential must be a bearer token.")
-		}
-		digest := sha256.Sum256([]byte(secret))
-		handler, err := httpapi.New(c, httpapi.Options{
-			CursorTTL: cursorTTL,
-			Authenticate: func(_ context.Context, value string) (core.Principal, error) {
-				got := sha256.Sum256([]byte(value))
-				if subtle.ConstantTimeCompare(digest[:], got[:]) == 1 {
-					return principal, nil
-				}
-				return "", core.Fail(core.Unauthenticated, nil)
-			},
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		return handler, handler.Close, nil
+func jsonExportHandler(c *core.Core, principal core.Principal, secret string) (http.Handler, func(context.Context) error, error) {
+	token := strings.TrimRight(secret, "=")
+	if token == "" || strings.ContainsFunc(token, func(r rune) bool {
+		return !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || strings.ContainsRune("-._~+/", r))
+	}) {
+		return nil, nil, InvalidConfig("The JSON HTTP credential must be a bearer token.")
 	}
+	digest := sha256.Sum256([]byte(secret))
+	handler, err := httpapi.New(c, httpapi.Options{
+		CursorTTL: time.Minute,
+		Authenticate: func(_ context.Context, value string) (core.Principal, error) {
+			got := sha256.Sum256([]byte(value))
+			if subtle.ConstantTimeCompare(digest[:], got[:]) == 1 {
+				return principal, nil
+			}
+			return "", core.Fail(core.Unauthenticated, nil)
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return handler, handler.Close, nil
+}
 
+func webDAVExportHandler(c *core.Core, root core.Address, principal core.Principal, username, secret string, createOnly bool) (http.Handler, error) {
 	if !utf8.ValidString(secret) || strings.ContainsFunc(secret, unicode.IsControl) {
-		return nil, nil, InvalidConfig("The WebDAV password must be UTF-8 without control characters.")
+		return nil, InvalidConfig("The WebDAV password must be UTF-8 without control characters.")
 	}
-	matches := passwordMatches(e.Auth.Username, secret)
-	handler, err := webdav.New(c, webdav.Options{
-		Prefix: "/", Root: core.Path(e.Root), CursorTTL: cursorTTL, Tree: directoryPlan, CreateOnly: e.CreateOnly,
+	matches := passwordMatches(username, secret)
+	return webdav.New(c, webdav.Options{
+		Prefix: "/", Root: root, CursorTTL: time.Minute, Tree: directoryPlan, CreateOnly: createOnly,
 		Limits: webdav.Limits{XMLBytes: 64 << 10, ListEntries: directoryPlan.MaxEntries, ListNameBytes: directoryPlan.MaxPlanBytes},
 		Authenticate: func(w http.ResponseWriter, r *http.Request) (core.Principal, bool) {
 			user, password, ok := r.BasicAuth()
@@ -72,16 +70,14 @@ func directoryHTTPHandler(c *core.Core, e Export, principal core.Principal, secr
 			return "", false
 		},
 	})
-	return handler, nil, err
 }
 
-func s3ExportHandler(startup, requests context.Context, saved ConfigSnapshot, c *core.Core, e Export, principal core.Principal, secret string, logger *log.Logger) (http.Handler, func(context.Context) error, error) {
-	opts := *e.S3
+func s3ExportHandler(startup, requests context.Context, base string, c *core.Core, opts S3ExportOptions, scope exportScope, principal core.Principal, accessKey, secret string, logger *log.Logger) (http.Handler, func(context.Context) error, error) {
 	options := s3.Options{
 		Region: cmp.Or(opts.Region, DefaultS3Region), CursorTTL: time.Minute, MaxPutBytes: cmp.Or(opts.MaxPutBytes, 5<<30),
-		Buckets: map[string]s3.Bucket{opts.Bucket: {Space: e.Root}},
+		Buckets: map[string]s3.Bucket{opts.Bucket: {Space: scope.root}},
 		LookupIdentity: func(_ context.Context, key string) (s3.Identity, error) {
-			if key != e.Auth.AccessKeyID {
+			if key != accessKey {
 				return s3.Identity{}, core.Fail(core.Unauthenticated, nil)
 			}
 			return s3.Identity{Principal: principal, SecretAccessKey: secret}, nil
@@ -93,16 +89,11 @@ func s3ExportHandler(startup, requests context.Context, saved ConfigSnapshot, c 
 	}
 
 	multipart := *opts.Multipart
-	dir := e.multipartDirectory(filepath.Dir(saved.Path))
-	state, err := openS3Multipart(startup, dir, principal, multipart.limits())
+	state, err := openS3Multipart(startup, multipart.directory(base), principal, multipart.limits())
 	if err != nil {
 		return nil, nil, err
 	}
-	retention := multipartRetention
-	if multipart.RetentionSeconds != 0 {
-		retention = time.Duration(multipart.RetentionSeconds) * time.Second
-	}
-	scope := e.scope()
+	retention := cmp.Or(time.Duration(multipart.RetentionSeconds)*time.Second, multipartRetention)
 	options.Multipart = &s3.MultipartOptions{
 		DB: state.db, Inputs: state.inputs, MaxUploads: 1024, MaxPendingParts: 32,
 		MaxObjectBytes: cmp.Or(multipart.MaxObjectBytes, multipart.MaxStagingBytes), Retention: retention,

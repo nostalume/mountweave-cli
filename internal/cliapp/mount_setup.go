@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,9 +23,10 @@ func ConfirmRestoredBinding(ask Prompt, out io.Writer, at string) error {
 }
 
 type mountCandidate struct {
-	record MountRecord
-	source MountSource
-	fresh  *OAuthGrant
+	record      MountRecord
+	source      MountSource
+	fresh       *OAuthGrant
+	sameKeyFile bool
 }
 
 func (app *App) readMountRecord(ctx context.Context, name string, prior MountRecord, priorRoute *Route, base string, in io.Reader) (mountCandidate, error) {
@@ -43,23 +45,21 @@ func (app *App) readMountRecord(ctx context.Context, name string, prior MountRec
 	candidate.source, err = PrepareMountSource(app, *m, base)
 	src := &candidate.source
 	if err != nil || m.Credential != nil || prior.Credential == nil ||
-		m.Driver != prior.Driver || src.Route != priorRoute {
+		m.Driver != prior.Driver || src.Route != priorRoute || (src.Audience.Origin == "" && !src.OptionalCredential) {
 		return candidate, err
 	}
-	switch {
-	case src.OptionalCredential:
-		// The typed decode above has already validated the record.
-		var fields map[string]json.RawMessage
-		if err = json.Unmarshal(data, &fields); err == nil && fields["credential"] == nil {
-			m.Credential = prior.Credential
+	if src.references().optional {
+		var edit struct {
+			Credential json.RawMessage `json:"credential"`
 		}
-	case src.Audience.Origin == "":
-	case src.KeyFile == "" || bytes.Equal(prior.Options, m.Options):
+		if err := json.Unmarshal(data, &edit); err != nil || edit.Credential != nil {
+			return candidate, err // An explicit null clears the optional reference.
+		}
+	}
+	if src.KeyFile == "" || bytes.Equal(prior.Options, m.Options) {
 		m.Credential = prior.Credential
-	default:
-		if old, err := priorRoute.prepareMount(&prior.Options, base, nil); err == nil && old.Audience == src.Audience {
-			m.Credential = prior.Credential
-		}
+	} else if old, err := priorRoute.prepareMount(&prior.Options, base, nil); err == nil && old.Audience == src.Audience {
+		m.Credential, candidate.sameKeyFile = prior.Credential, old.KeyFile == src.KeyFile
 	}
 	return candidate, err
 }
@@ -88,6 +88,7 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 			return mountCandidate{}, err
 		}
 	}
+	m.At = mountedPath(m.At, true)
 	if err := core.ValidatePath(m.At); err != nil {
 		return mountCandidate{}, err
 	}
@@ -100,16 +101,18 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 	var connection SourceConnection
 	if prior.Driver == "" {
 		connections := slices.DeleteFunc(slices.Clone(choice.connections), func(c SourceConnection) bool { return !c.guided() })
+		if len(connections) == 0 {
+			return mountCandidate{}, unavailableSource()
+		}
 		connection = connections[0]
 		if len(connections) > 1 {
-			var methods []string
+			methods := make([]string, 0, len(connections))
+			labels := make([]string, 0, len(connections))
 			for _, item := range connections {
 				methods = append(methods, item.Method)
-				if _, err := fmt.Fprintf(out, "  %-8s %s\n", item.Method, item.Label); err != nil {
-					return mountCandidate{}, err
-				}
+				labels = append(labels, fmt.Sprintf("%-8s %s", item.Method, item.Label))
 			}
-			method, err := AskChoice(ask, "Connection", connection.Method, methods...)
+			method, err := askMenu(ask, "Connection", connection.Method, methods, labels)
 			if err != nil {
 				return mountCandidate{}, err
 			}
@@ -122,7 +125,7 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 		return mountCandidate{record: m, source: MountSource{Route: r}}, nil
 	}
 	if connection.ConfirmSetup {
-		answer, err := AskChoice(ask, "WebDAV authorization (existing to reuse credentials, setup to open the setup page)", "existing", "existing", "setup")
+		answer, err := askMenu(ask, "WebDAV authorization", "existing", []string{"existing", "setup"}, []string{"existing   Use an app password", "setup      Open the setup page"})
 		if err != nil {
 			return mountCandidate{}, err
 		}
@@ -149,17 +152,25 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 		}
 	}
 	preparePrompt := ask
+	base := filepath.Dir(saved.Path)
+	var src MountSource
 	var fresh *OAuthGrant
 	var err error
 	if r.managed.available() && prior.Driver == "" && ManagedStoreSupported {
 		method := r.managed.Method
 		if !r.managed.ManagedOnly && !r.managed.ReferenceInGrant {
-			method, err = AskChoice(ask, "Authorization ("+method+" or reference)", method, method, "reference")
+			method, err = AskMenu(ask, "Authorization", method, method, "reference")
 			if err != nil {
 				return mountCandidate{}, err
 			}
 		}
 		if method == r.managed.Method {
+			if r.managed.ConfigureBeforeGrant {
+				src, err = r.prepareMount(&m.Options, base, ask)
+				if err != nil {
+					return mountCandidate{}, err
+				}
+			}
 			var scopes []string
 			if r.managed.ChooseScopes != nil {
 				scopes, err = r.managed.ChooseScopes(ask)
@@ -186,9 +197,11 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 	if !r.Interactive {
 		return mountCandidate{}, sourceNeedsRecord()
 	}
-	src, err := r.prepareMount(&m.Options, filepath.Dir(saved.Path), preparePrompt)
-	if err != nil {
-		return mountCandidate{}, err
+	if src.Route == nil {
+		src, err = r.prepareMount(&m.Options, base, preparePrompt)
+		if err != nil {
+			return mountCandidate{}, err
+		}
 	}
 	keepManaged := m.Credential != nil && m.Credential.Kind == ManagedCredential && r.managed.available()
 	if src.Audience.Origin == "" {
@@ -204,7 +217,10 @@ func (app *App) promptMount(ctx context.Context, at string, prior MountRecord, r
 			default:
 				return PromptReference(raw)
 			}
-		}, policy.check)
+		}, func(ref *CredentialRef) error {
+			_, err := policy.opener(ref)
+			return err
+		})
 		if err != nil {
 			return mountCandidate{}, err
 		}
@@ -231,12 +247,26 @@ func (app *App) promptSource(ask Prompt, out io.Writer) (string, error) {
 	if slices.Contains(names, "local") {
 		current = "local"
 	}
+	var displayed []string
 	for {
-		query, err := ask("Source name or type (? to list)", current)
+		label := "Source name or type (? to list)"
+		if len(displayed) != 0 {
+			label = "Source number or name (? to list)"
+		}
+		query, err := ask(label, current)
 		if err != nil {
 			return "", err
 		}
 		query = strings.ToLower(strings.TrimSpace(query))
+		if n, err := strconv.Atoi(query); err == nil && len(displayed) != 0 {
+			if n > 0 && n <= len(displayed) {
+				return displayed[n-1], nil
+			}
+			if _, err := fmt.Fprintln(out, "Choose a number from the displayed list."); err != nil {
+				return "", err
+			}
+			continue
+		}
 		if slices.Contains(names, query) {
 			return query, nil
 		}
@@ -244,9 +274,10 @@ func (app *App) promptSource(ask Prompt, out io.Writer) (string, error) {
 			return "", sourceNeedsRecord()
 		}
 		if query == "?" {
-			if err := app.printSources(out, names); err != nil {
+			if err := app.printSources(out, names, true); err != nil {
 				return "", err
 			}
+			displayed = names
 			continue
 		}
 		matches := app.sourceNames(query, SourceConnection.guided)
@@ -262,9 +293,10 @@ func (app *App) promptSource(ask Prompt, out io.Writer) (string, error) {
 		if _, err := fmt.Fprintln(out, "Matching sources"); err != nil {
 			return "", err
 		}
-		if err := app.printSources(out, matches); err != nil {
+		if err := app.printSources(out, matches, true); err != nil {
 			return "", err
 		}
+		displayed = matches
 	}
 }
 

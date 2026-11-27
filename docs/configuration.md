@@ -29,10 +29,12 @@ keys keep their native interpretation.
 The file contains `version`, `mounts` and optional `exports`. An omitted
 export list is empty. A mount record has `at`, `driver`, `options` and an
 optional `credential`. The `driver` field names the source. Use `connection`
-when that source offers multiple methods: `website` or `open` for `alipan`,
-and `webdav` or `open` for `pan123`. Existing records for these two sources
-that omit the method use Open. Earlier `alipan-web` records still load as
-website connections. Local omits the credential and takes `options.root`.
+when the source offers multiple methods. Aliyun Drive (`alipan`), Baidu
+Netdisk (`baidupan`), Guangya Pan (`guangyapan`) and 115 Cloud Drive
+(`pan115`) offer `website` and `open`. 123 Cloud Drive (`pan123`) also offers
+`webdav`. Existing records for these five sources that omit `connection`
+use Open. Earlier `alipan-web` records still load as website connections.
+Local omits the credential and takes `options.root`.
 For example, `{"at":"/files","driver":"local","options":{"root":"./data"}}`
 mounts a directory relative to the configuration file. A reference has `kind`
 and `ref`. The kinds identify an environment variable (`env`), a protected
@@ -49,11 +51,17 @@ The default file is `%LOCALAPPDATA%\mweave\config.json` on Windows and
 use `mweave/config.json` under the system's per-user configuration directory.
 Use `--config FILE` to select a different file.
 
-Managed credentials use `credentials` under the default application directory.
-Windows protects managed records with the current user's DPAPI key. Linux
-protects these records with file ownership and permissions and stores them
-without encryption. Managed credentials and saved website sessions require
-Windows or Linux. `--config` only changes which JSON file is read.
+A `managed` reference is the ID of a local authorization record. Its value
+locates `credentials/<ref>.grant` under the default application directory.
+`--config` selects the JSON settings file. The credential store is shared by
+configs run under the same user.
+
+On Windows the store is under `%LOCALAPPDATA%\mweave`. DPAPI encrypts each
+authorization record for the current Windows user. On Linux the store is
+under `${XDG_CONFIG_HOME:-$HOME/.config}/mweave`. Linux records contain
+unencrypted authorization data. The store checks ownership and private
+permissions on its directories and files. Website sessions also depend on a
+dedicated local browser profile.
 
 Write JSON as UTF-8 without a byte-order mark.
 
@@ -99,7 +107,7 @@ activation failure.
 | Edit a directory, name or other ordinary setting | Keep the credential reference by default. Preview the public changes and the account label or reference status. Static edit, preview and save use the reference alone. An explicit remote check may resolve it. |
 | Reauthorize the current account | Choose `reauthorize` in `mount edit PATH` when offered. The editor shows the mounts sharing the authorization and verifies the account and scope before replacing the protected record. |
 | Switch one mount to a different account | Select an existing compatible reference or set up a new one, then change that mount's reference. Verify the selected destination and access before saving the switch. Other mounts retain their own references. |
-| Restore a missing managed authorization | Open `mount edit PATH` and reconnect the saved mount. Choose an existing compatible authorization when offered. Confirm the verified account and folder if the original binding cannot be proved. |
+| Restore a missing or undecryptable managed authorization | Open `mount edit PATH` and reconnect the saved mount. Choose an existing compatible authorization when offered. Confirm the verified account and folder if the original binding cannot be proved. |
 
 Preview and output show safe labels and status. Secret inputs start empty with
 an explicit keep or replace choice. The editor never receives the old secret
@@ -157,20 +165,28 @@ before retrying a failed mutation: a failure can have a partial effect.
 
 ## Restore settings on another machine
 
-Copy the JSON config and keep its relative directory layout or update its
-paths. Recreate the referenced keys, credential files and environment
-variables securely. Then use the mount or start `serve` as usual. If an
-error identifies a missing sign-in, follow its `mount edit` command. For
-an expired grant, follow any instruction to choose `reauthorize`. Access
-is verified before a replacement authorization is saved.
+1. Copy the JSON config. Keep its relative directory layout or update its paths.
+2. Restore the keys, private files, environment variables and SDK profiles the config references.
+3. Run `mweave --config FILE mount list` to see local credential problems.
+4. Run `mweave --config FILE mount edit` to select a mount by number, or specify
+   its path. Reuse a compatible authorization if offered, or sign in. Website
+   mounts offer a separate settings edit that keeps the existing authorization.
 
-Use `mount list` to find a saved mount name. To check one restored folder,
+Treat Windows `.grant` files and website profiles as local state. If a copied
+record cannot be decrypted, reconnect to save a new reference after verification.
+Other mounts keep their own references. If the record can be read but its
+browser profile is missing, sign in again and verify the saved account and folder.
+
+The list checks local references without contacting a service. It checks the
+presence of credential files, usable environment values, managed records and
+website profiles. Access through an SDK profile and remote authorization
+acceptance are verified during use. To check one restored folder,
 run `mweave --config FILE ls /cloud --limit 1`, replacing `/cloud` with
 the mount name. For an object store, use `ls key:/cloud: --limit 1` with
 the same config. To restore an export, start `serve` and connect with
 its client.
 
-Local staging and S3 multipart state have separate lifetimes; do not copy
+Local staging, website upload staging, and S3 multipart state have separate lifetimes. Do not copy
 their contents as ordinary configuration. Restore Pool metadata with its
 matching member data. See the [Pool settings](sources.md#pool-mounts) and
 [multipart recovery](specification.md#resume-s3-multipart-uploads) before

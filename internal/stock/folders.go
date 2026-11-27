@@ -336,17 +336,65 @@ func prepare115(opts accountFolderOptions, _ string) (cliapp.MountSource, error)
 	return src, nil
 }
 
-func prepare123(opts accountFolderOptions, _ string) (cliapp.MountSource, error) {
-	if err := opts.check(); err != nil {
+type pan123Options struct {
+	RootPath         string `json:"root_path,omitempty"`
+	RootID           string `json:"root_id,omitempty"`
+	MaxResponseBytes int64  `json:"max_response_bytes,omitempty"`
+	MaxResolvePages  int    `json:"max_resolve_pages,omitempty"`
+	AllowWrite       bool   `json:"allow_write,omitempty"`
+	MaxUploadBytes   int64  `json:"max_upload_bytes,omitempty"`
+}
+
+func guide123(o *pan123Options, ask cliapp.Prompt) error {
+	if err := askFolder(ask, &o.RootID, &o.RootPath, "Folder path (/...) or ID (empty for account root; - resets)"); err != nil {
+		return err
+	}
+	return askWriteAccess(ask, &o.AllowWrite)
+}
+
+func askWriteAccess(ask cliapp.Prompt, writable *bool) error {
+	current := "read"
+	if *writable {
+		current = "read_write"
+	}
+	access, err := cliapp.AskMenu(ask, "Access", current, "read", "read_write")
+	if err == nil {
+		*writable = access == "read_write"
+	}
+	return err
+}
+
+const pan123UploadHost = "openapi-upload.123pan.com"
+
+func prepare123(opts pan123Options, _ string) (cliapp.MountSource, error) {
+	folder := accountFolderOptions{RootPath: opts.RootPath, RootID: opts.RootID,
+		MaxResponseBytes: opts.MaxResponseBytes, MaxResolvePages: opts.MaxResolvePages}
+	if err := folder.check(); err != nil {
 		return cliapp.MountSource{}, err
 	}
+	if opts.MaxUploadBytes < 0 || opts.MaxUploadBytes > 1_000_000_000 {
+		return cliapp.MountSource{}, cliapp.InvalidConfig("123 Open max_upload_bytes must fit the single-request limit of 1 GB.")
+	}
 	src := pan123Authorization.BearerSource(func(ctx context.Context, api *http.Client) (core.Driver, error) {
-		return cliapp.NativeDriver(pan123.Open(ctx, pan123.Options{
+		native := pan123.Options{
 			RootID: opts.RootID, RootPath: opts.RootPath, MaxResponseBytes: opts.MaxResponseBytes, MaxResolvePages: opts.MaxResolvePages,
-			Client: api,
-		}))
+			Client: api, AllowMkdir: opts.AllowWrite,
+		}
+		if opts.AllowWrite && api != nil {
+			upload, ok := api.Transport.(cliapp.TokenHeaderTransport)
+			if !ok {
+				return nil, core.Fail(core.InvalidRequest, nil)
+			}
+			upload.Hosts = []string{pan123UploadHost, pan123UploadHost + ":443"}
+			native.UploadClient = &http.Client{Transport: upload}
+			native.MaxUploadBytes = cmp.Or(opts.MaxUploadBytes, 64<<20)
+		}
+		return cliapp.NativeDriver(pan123.Open(ctx, native))
 	}, nil, pan123.ControlHost)
 	location := cliapp.MountLocation{Location: "Account root", Access: "Browse and download within this folder"}
+	if opts.AllowWrite {
+		location.Access = "Browse, download, create files and create directories"
+	}
 	switch {
 	case opts.RootPath != "" && opts.RootPath != "/":
 		location.Location, location.Quote = opts.RootPath, true
@@ -531,7 +579,7 @@ func prepareGoogleDrive(o googleDriveOptions, _ string) (cliapp.MountSource, err
 			RootID: o.RootID, RootPath: o.RootPath, ExportFormats: o.ExportFormats,
 			MaxResponseBytes: o.MaxResponseBytes, MaxResolvePages: o.MaxResolvePages, Client: api, ContentClient: storageHTTPClient,
 		}))
-	}, []string{googleDriveReadScope}, googledrive.ControlHost), nil
+	}, []string{googledrive.ReadOnlyScope}, googledrive.ControlHost), nil
 }
 
 type dropboxOptions struct {
@@ -553,7 +601,10 @@ func guideDropbox(o *dropboxOptions, ask cliapp.Prompt) error {
 	} else if err := cliapp.AskFields(ask, cliapp.Field("Namespace ID", &o.NamespaceID)); err != nil {
 		return err
 	}
-	return cliapp.AskFields(ask, cliapp.Field("Folder path (/ for selected root)", &o.RootPath))
+	if err := cliapp.AskFields(ask, cliapp.Field("Folder path (/ for selected root)", &o.RootPath)); err != nil {
+		return err
+	}
+	return askWriteAccess(ask, &o.AllowCreate)
 }
 
 func (o dropboxOptions) native() (dropbox.Options, error) {
@@ -586,7 +637,7 @@ func prepareDropbox(o dropboxOptions, _ string) (cliapp.MountSource, error) {
 		opts.Client = api
 		return cliapp.NativeDriver(dropbox.Open(ctx, opts))
 	}
-	return dropboxAuthorization.BearerSource(open, options.AuthorizationScopes(), dropbox.ControlHost, "content.dropboxapi.com"), nil
+	return dropboxAuthorization.BearerSource(open, options.AuthorizationScopes(), dropbox.ControlHost, dropbox.ContentHost), nil
 }
 
 type authorizedRootOptions struct {

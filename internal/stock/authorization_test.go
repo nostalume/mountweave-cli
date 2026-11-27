@@ -279,7 +279,10 @@ func Test115ScanAndRecovery(t *testing.T) {
 		}
 		return unexpectedAuthRequest(r)
 	})
-	const add = "115\n\n\n\ny\n"
+	add := "115\n\n\n\ny\n"
+	if pan115WebsiteRoute() != nil {
+		add = "115\nopen\n\n\n\ny\n"
+	}
 	invokeCLI(t, config, add, true, 0, "mount", "add", "/115")
 	invokeCLI(t, config, add, true, 0, "mount", "add", "/shared")
 	saved := authSnapshot(t, config)
@@ -308,11 +311,15 @@ func Test123ApplicationReissue(t *testing.T) {
 	t.Setenv("MWEAVE_123_FIXTURE_SECRET", "fixture-secret")
 	t.Setenv("MWEAVE_123_FIXTURE_NEW_SECRET", "fixture-new")
 	const id = "9007199254740993"
-	var issued int
-	var wrong bool
+	var issued, created, uploaded int
+	var wrong, wrongUploadHost bool
 	useSealedTransport(t, func(r *http.Request) (*http.Response, error) {
-		if r.URL.Scheme != "https" || r.URL.Host != "open-api.123pan.com" {
+		if r.URL.Scheme != "https" || (r.URL.Host != "open-api.123pan.com" && r.URL.Host != pan123UploadHost) {
+			t.Errorf("123 credential escaped to %q", r.URL.Host)
 			return unexpectedAuthRequest(r)
+		}
+		if (r.URL.Host == pan123UploadHost) != (r.URL.Path == "/upload/v2/file/single/create") {
+			t.Error("123 control and upload recipients were mixed")
 		}
 		if r.Header.Get("Platform") != "open_platform" {
 			t.Error("missing 123 API platform")
@@ -354,11 +361,42 @@ func Test123ApplicationReissue(t *testing.T) {
 				t.Error("a different root was queried")
 			}
 			return reply(`{"lastFileId":-1,"fileList":[]}`)
+		case "POST /upload/v1/file/mkdir":
+			var body struct {
+				Name   string      `json:"name"`
+				Parent json.Number `json:"parentID"`
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil || body.Name != "new-folder" || body.Parent.String() != id {
+				t.Error("123 mkdir did not target the exact mounted parent")
+			}
+			created++
+			return reply(`{"dirID":9007199254740995}`)
+		case "GET /upload/v2/file/domain":
+			if wrongUploadHost {
+				return reply(`["https://unexpected.invalid"]`)
+			}
+			return reply(`["https://` + pan123UploadHost + `"]`)
+		case "POST /upload/v2/file/single/create":
+			if err := r.ParseMultipartForm(4096); err != nil {
+				t.Fatal(err)
+			}
+			defer r.MultipartForm.RemoveAll()
+			body, _, err := r.FormFile("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, readErr := io.ReadAll(body)
+			if errors.Join(readErr, body.Close()) != nil || string(payload) != "sample" || r.FormValue("filename") != "new.txt" ||
+				r.FormValue("parentFileID") != id || r.FormValue("duplicate") != "" || r.Header.Get("Cookie") != "" {
+				t.Error("123 upload did not preserve the payload, destination or exclusive policy")
+			}
+			uploaded++
+			return reply(`{"fileID":9007199254740996,"completed":true}`)
 		}
 		return unexpectedAuthRequest(r)
 	})
 	var output, prompts bytes.Buffer
-	input := strings.NewReader("pan123\nopen\nauthorize\nfixture-app\nenv:MWEAVE_123_FIXTURE_SECRET\n/Archive\ny\n")
+	input := strings.NewReader("pan123\nopen\nauthorize\nfixture-app\nenv:MWEAVE_123_FIXTURE_SECRET\n/Archive\nread_write\ny\n")
 	if code := testApp.Run(t.Context(), []string{"--config", config, "mount", "add", "/app"}, input, &output, &prompts, true); code != 0 ||
 		!strings.Contains(prompts.String(), "Location     \"/Archive\"") ||
 		!strings.Contains(prompts.String(), "Selected location verified\nSave mount?") {
@@ -384,6 +422,13 @@ func Test123ApplicationReissue(t *testing.T) {
 	if grant := readAuthGrant(t, &pan123Authorization, ref); issued != 4 || grant.Access != "token-4" ||
 		grant.SecretRef.Ref != "MWEAVE_123_FIXTURE_NEW_SECRET" || authSnapshot(t, config).Digest != saved.Digest {
 		t.Fatal("same-account reissue did not use the updated reference and preserve the mount")
+	}
+	invokeCLI(t, config, "", false, 0, "mkdir", "/app/new-folder", "--json")
+	invokeCLI(t, config, "sample", false, 0, "put", "-", "/app/new.txt", "--size", "6", "--json")
+	wrongUploadHost = true
+	invokeCLI(t, config, "sample", false, 1, "put", "-", "/app/new.txt", "--size", "6", "--json")
+	if created != 1 || uploaded != 1 {
+		t.Fatalf("123 mutations: mkdir=%d, upload=%d", created, uploaded)
 	}
 }
 
@@ -592,7 +637,8 @@ func TestLoopbackAuthorization(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp4", callbackAddress.Load().(string))
 	}, DisableKeepAlives: true}
 	callback := &http.Client{Transport: callbackTransport}
-	const dropboxReadScope = "account_info.read files.content.read files.metadata.read"
+	const dropboxScope = "account_info.read files.content.read files.content.write files.metadata.read"
+	const googleDriveReadScope = "https://www.googleapis.com/auth/drive.readonly"
 	var browserQuery atomic.Value
 	cliapp.LaunchOAuthBrowser = func(ctx context.Context, target string) error {
 		u, err := url.Parse(target)
@@ -604,7 +650,7 @@ func TestLoopbackAuthorization(t *testing.T) {
 		switch u.Host {
 		case "www.dropbox.com":
 			if q.Get("client_id") != "fixture-app" || q.Get("token_access_type") != "offline" || redirect != dropboxRedirect ||
-				strings.Join(cliapp.OAuthScopeSet(q.Get("scope")), " ") != dropboxReadScope {
+				strings.Join(cliapp.OAuthScopeSet(q.Get("scope")), " ") != dropboxScope {
 				return errors.New("incorrect Dropbox browser authorization")
 			}
 		case "accounts.google.com":
@@ -675,8 +721,8 @@ func TestLoopbackAuthorization(t *testing.T) {
 			if isGoogle {
 				return authReply(r, http.StatusOK, fmt.Sprintf(`{"access_token":"google-access","refresh_token":"sealed-google-refresh","scope":%q,"token_type":"Bearer","expires_in":3600}`, googleDriveReadScope))
 			}
-			return authReply(r, http.StatusOK, fmt.Sprintf(`{"access_token":"dropbox-access","refresh_token":"sealed-dropbox-refresh","account_id":"db-account","scope":%q,"token_type":"Bearer","expires_in":3600}`, dropboxReadScope))
-		case "api.dropboxapi.com/2/users/get_current_account", "api.dropboxapi.com/2/files/get_metadata", "api.dropboxapi.com/2/files/list_folder":
+			return authReply(r, http.StatusOK, fmt.Sprintf(`{"access_token":"dropbox-access","refresh_token":"sealed-dropbox-refresh","account_id":"db-account","scope":%q,"token_type":"Bearer","expires_in":3600}`, dropboxScope))
+		case "api.dropboxapi.com/2/users/get_current_account", "api.dropboxapi.com/2/files/get_metadata", "api.dropboxapi.com/2/files/list_folder", "api.dropboxapi.com/2/files/move_v2":
 			if auth != "Bearer dropbox-access" {
 				return nil, errors.New("incorrect Dropbox access credential")
 			}
@@ -684,7 +730,29 @@ func TestLoopbackAuthorization(t *testing.T) {
 			case "/2/users/get_current_account":
 				return authReply(r, http.StatusOK, `{"account_id":"db-account","email":"db@fixture.invalid"}`)
 			case "/2/files/get_metadata":
-				return authReply(r, http.StatusOK, `{".tag":"folder","id":"id:folder","name":"Folder"}`)
+				var q struct{ Path string }
+				if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+					return nil, err
+				}
+				switch q.Path {
+				case "/Folder":
+					return authReply(r, http.StatusOK, `{".tag":"folder","id":"id:folder","name":"Folder","path_lower":"/folder"}`)
+				case "id:folder/dropbox.txt":
+					return authReply(r, http.StatusOK, `{".tag":"file","id":"id:file","name":"dropbox.txt","path_lower":"/folder/dropbox.txt","size":1}`)
+				default:
+					return unexpectedAuthRequest(r)
+				}
+			case "/2/files/move_v2":
+				var q struct {
+					From       string `json:"from_path"`
+					To         string `json:"to_path"`
+					Autorename *bool
+				}
+				if err := json.NewDecoder(r.Body).Decode(&q); err != nil || q.From != "id:file" || q.To != "id:folder/renamed.txt" ||
+					q.Autorename == nil || *q.Autorename {
+					return nil, errors.New("Dropbox move did not select an exact native item and destination")
+				}
+				return authReply(r, http.StatusOK, `{"metadata":{".tag":"file","id":"id:file","name":"renamed.txt","path_lower":"/folder/renamed.txt","size":1}}`)
 			default:
 				return authReply(r, http.StatusOK, `{"entries":[{".tag":"file","id":"id:file","name":"dropbox.txt","size":1}],"cursor":"cursor","has_more":false}`)
 			}
@@ -705,10 +773,11 @@ func TestLoopbackAuthorization(t *testing.T) {
 		}
 	})
 
-	invokeCLI(t, config, "dropbox\n\n\n\n/Folder\ny\n", true, 0, "mount", "add", "/dropbox")
+	invokeCLI(t, config, "dropbox\n\n\n/Folder\n2\n\ny\n", true, 0, "mount", "add", "/dropbox")
 	if got := invokeCLI(t, config, "", false, 0, "ls", "/dropbox", "--json"); !bytes.Contains(got.Result, []byte("dropbox.txt")) {
 		t.Fatalf("Dropbox listing: %s", got.Result)
 	}
+	invokeCLI(t, config, "", false, 0, "mv", "/dropbox/dropbox.txt", "/dropbox/renamed.txt", "--json")
 	appFile := filepath.Join(filepath.Dir(config), "desktop.json")
 	writeFixture(t, appFile, []byte(`{"installed":{"client_id":"fixture-google","client_secret":"sealed-google-secret","token_uri":"https://untrusted.invalid"}}`))
 	invokeCLI(t, config, "googledrive\n\n\n"+appFile+"\nvault\ny\n", true, 0, "mount", "add", "/drive")

@@ -9,9 +9,9 @@ for saved records, and [storage sources](sources.md) for provider options.
 See [setup values](sources.md#find-setup-values) for where to obtain each input.
 
 1. Run `mweave mount add` and enter a service name or access type. Enter `?`
-   to list sources. If several services match, show their names and descriptions.
-   Choose a connection method if the service offers more than one. For unattended
-   setup, supply the saved source and connection in the record.
+   to list sources. Choose by number from the displayed list or enter a name.
+   Connection and other setup menus accept their displayed numbers too.
+   For unattended setup, supply the source and connection in the record.
 2. Reuse an authorized profile when it covers the intended access. Otherwise
    request the narrowest supported grant through the provider's consent flow
    or enter a service-issued credential through protected input. Account
@@ -26,7 +26,7 @@ See [setup values](sources.md#find-setup-values) for where to obtain each input.
    fails, report whether a reusable authorization was saved. An existing
    mount path is a conflict. Use `mount edit` to update it.
 
-`mount list` shows saved mounts without connecting. Use `stat /nas` to see
+`mount list` shows saved mounts and local credential problems without connecting. Use `stat /nas` to see
 the entry at that path or `ls /nas` to browse its contents. File operations
 report access failures from the selected mount. Credential changes follow
 the [editing contract](configuration.md#editing-credentials).
@@ -38,8 +38,8 @@ selects a file. Otherwise read `config.json` in the
 [default application directory](configuration.md#configuration-and-secrets).
 Command options can appear before or after operands. `--` ends option
 parsing. Unknown options and duplicate scalar values are usage errors. Local
-file operands use the host's path rules. Mount operands use absolute addresses
-in the configured namespace.
+file operands use the host's path rules. Mounted addresses are relative to the
+mounted root when the leading slash is omitted.
 
 ### Command navigation
 
@@ -58,19 +58,39 @@ reports the build under the same conditions.
 
 | Command | Behavior |
 | --- | --- |
-| `ls ADDRESS`, `stat ADDRESS` | List children or inspect one entry. `ls --limit N` limits the number of emitted entries. |
+| `ls [ADDRESS]` | List one directory, defaulting to the mounted root `/`. Text shows one name per line with `/` after directory names. `--limit N` caps the number of entries. |
+| `stat ADDRESS` | Show information about one entry. |
 | `get ADDRESS FILE\|-` | Download to a new local file or stream bytes to stdout with `-`. The named form publishes the completed file and refuses to replace an existing destination. |
 | `put FILE\|- ADDRESS` | Upload a local file or stream from stdin. The opened file supplies its length when known. For stdin, `--size BYTES` supplies an explicit length when the selected Driver requires it. |
-| `cp SOURCE TARGET`, `mv SOURCE TARGET` | Use exact destinations and the same syntax across mounts. `cp -r` selects Core tree copy. `mv` uses Core Move for both files and directories. |
-| `mkdir PATH`, `rm ADDRESS`, `rmdir PATH` | Create a directory, remove a non-directory, or remove an empty directory. `rm -r` selects the bounded Core tree removal for a tree path. |
+| `cp SOURCE TARGET`, `mv SOURCE TARGET` | Use a complete target path or end the target with `/` to place the source in an existing directory. `cp -r` copies a tree. |
+| `mkdir PATH` | Create a directory. |
+| `trash ADDRESS` | Move one file to the source's recycle bin. |
+| `remove ADDRESS`, `rmdir PATH` | Permanently delete one file or an empty directory, respectively. |
+
+Listing above a saved mount reads the mount layout without opening the source.
+
+For `mv`, `cp` and local-file `put`, a target ending in `/` is an existing
+mounted directory. For example, `mweave mv /drive/report.pdf /drive/archive/`
+prefers `report.pdf` and may place it under an unused name. The command
+reports the actual destination in text and JSON. Directory placement
+preserves occupants. A driver may allocate the name during its native move;
+otherwise Core selects a candidate and uses an exclusive operation. A
+concurrent creation can occupy that candidate before the operation commits.
+Standard input and `--replace` take complete target paths. An explicit
+`key:` address always names the exact key, including its trailing slash.
 
 Ordinary writes and copies create a new destination. A file `put --replace`
 or `cp --replace` selects Core complete publication and allows replacement
 or creation. A conflicting directory or an unavailable native guarantee
-returns the Core error. Recursive copy and removal take tree paths. The
-file-only `--replace` option is incompatible with `cp -r`. The CLI passes
-typed removal constraints to Core. Directory plans use serial execution and
-host defaults of 10,000 entries and 8 MiB of relative-path bytes.
+returns the Core error. Recursive copy takes tree paths and is incompatible
+with `--replace`. Directory plans use serial execution and host defaults of
+10,000 entries and 8 MiB of relative-path bytes.
+
+Deletion asks Core for the selected effect. The source must guarantee that
+effect for the selected item or return `unsupported_operation` before
+changing it. `rmdir` also requires the directory to be empty at deletion time.
+The former `rm` command now reports the replacement commands before loading
+settings. Protocol exports keep their own deletion contracts.
 
 Local complete publication uses `staging_directory` and `max_staging_bytes`.
 Choose a private staging directory outside the mounted directory on the
@@ -80,12 +100,30 @@ shares (9p). S3 complete publication uses `part_size` and
 `max_buffered_bytes`. The selected Driver and its service determine which
 mutation guarantees are available.
 
+### Interactive shell
+
+`mweave shell [PATH]` opens a terminal session at the specified mounted
+directory or at `/`. Enter file commands with their usual options. `cd PATH`
+changes the mounted directory, `pwd` prints it, and `exit` or end of input
+closes the session. Bare `ls` lists the current directory. Mounted paths
+starting with a separator are absolute. Relative mounted paths can use
+`.` and `..`. Local paths resolve from the process working directory and
+`key:` addresses keep their exact meaning.
+
+Quote arguments with spaces using single or double quotes. Backslashes remain
+literal so Windows paths can be entered as written. File transfers in the
+shell use named local files. Use one-shot commands with `-` for pipelines.
+
+The shell reads settings once and opens sources on demand. A failed command
+returns to the prompt. Ctrl+C cancels the current operation. On exit, the
+session closes the sources it opened.
+
 ### Settings and protocol access
 
 | Command | Behavior |
 | --- | --- |
-| `mount list` | Show saved mount records and Driver availability in this build. |
-| `mount add [PATH]`, `mount edit PATH`, `mount remove PATH` | Change saved mount records. Add and edit accept `--from FILE` or `--from -`. |
+| `mount list` | Show saved mounts, Driver availability and local credential problems. |
+| `mount add [PATH]`, `mount edit [PATH]`, `mount remove PATH` | Change saved mount records. Interactive edit can select a mount by number. Edit with `--from` or `--json` requires a path. Add and edit accept `--from FILE` or `--from -`. |
 | `export add` | Save an export through guided setup or with `--from FILE` or `--from -`. |
 | `serve` | Start listeners for the saved exports. See [Protocol setup](#protocol-setup). |
 
@@ -96,7 +134,13 @@ protected references as the main configuration.
 
 ### Addressing
 
-A tree path such as `/nas/report.pdf` is passed to Core as a tree address.
+`nas/report.pdf` and `/nas/report.pdf` address the same mounted path. The CLI
+accepts both slash styles in mounted paths. Directory commands such as `ls`
+and `mkdir`, mount paths and export roots also accept a final separator.
+Path segments retain their case and spaces. Empty segments and `.` or `..` are
+invalid. Saved configuration and records passed with `--from` use absolute
+mounted paths.
+
 Use a single quoted argument such as `'key:/objects:a//b'` for a native key.
 The colon after the mount separates it from the key. Encode a literal colon
 or percent in the mount name as `%3A` or `%25`. Decode the mount once and
@@ -124,17 +168,18 @@ credential (`credential_unavailable`), an incompatible credential destination (`
 `cancelled` respectively.
 
 Preserve the result when it contains known effects or partial output. Use a
-null result when there is no receipt. Human output presents the same effects
-and quotes untrusted names so that they cannot control the terminal.
+null result when there is no receipt. Text output shows names as written and
+escapes control characters. `stat` shows the address, type and available metadata.
+`mount list` shows each path followed by its source and connection. A local credential problem includes its cause and next action. An interactive `mount edit` without a path puts mounts with local problems first.
 
 | Operation | JSON result |
 | --- | --- |
 | `stat` | Core entry with its structured address. |
 | `ls` | `items` of the same entry type and a `state` of `complete`, `limited` or `failed`. |
-| `get ADDRESS FILE`, `put`, file `cp`, `mkdir`, `rm`, `rmdir` | `effect`. |
-| Recursive `cp` or `rm` | `effect` and per-item `items`. |
+| `get ADDRESS FILE`, `put`, file `cp`, `mkdir`, `trash`, `remove`, `rmdir` | `effect`. |
+| Recursive `cp` | `effect` and per-item `items`. |
 | `mv` | `source_effect` and `target_effect`, with per-item `items` for a tree execution and `target_removed_effect` if Core reports removal of the prior target. |
-| `mount list` | `items` containing each saved `at`, `driver` and the build-time boolean `driver_available`, plus `connection` when saved. |
+| `mount list` | `items` containing each saved `at`, `driver` and the build-time boolean `driver_available`, plus `connection` when saved and `problem` when a local credential problem is detected. Per-mount problems do not change the listing exit status. |
 | `mount add`, `mount edit`, `mount remove`, `export add` | The saved `at` or `listen` and the configuration `effect`. |
 
 Interactive reauthorization reports the authorization effect and the affected

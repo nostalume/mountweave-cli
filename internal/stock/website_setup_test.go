@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -72,13 +73,14 @@ func TestWebsiteMountTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := func(input string, ok bool, args ...string) {
+	run := func(input string, ok bool, args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
 		code := app.Run(ctx, append([]string{"--config", config}, args...), strings.NewReader(input), &out, &out, true)
 		if (code == 0) != ok {
 			t.Fatalf("%v => %d: %s", args, code, out.String())
 		}
+		return out.String()
 	}
 	save := func() cliapp.ConfigSnapshot {
 		t.Helper()
@@ -129,13 +131,69 @@ func TestWebsiteMountTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if out := run("\n\n", true, "mount", "edit"); !strings.Contains(out, "Edit settings") ||
+		candidate != profile || opens != 3 || closes != 3 || save().Digest != saved.Digest {
+		t.Fatalf("editing ordinary settings reopened the website or changed authorization: %s", out)
+	}
+
 	rootID = "different-folder"
-	run("y\n", false, "mount", "edit", "/drive")
+	run("2\ny\n", false, "mount", "edit", "/drive")
 	assertGone(candidate)
 	if _, err := os.Stat(profile); err != nil || save().Digest != saved.Digest || opens != closes {
 		t.Fatalf("rejected root invalidated existing authorization: %v", err)
 	}
 	rootID = "folder-42"
+	if err := os.Remove(profile); err != nil {
+		t.Fatal(err)
+	}
+	action := cliapp.MountEditAction(saved.Path, "/drive")
+	if out := run("", true, "mount", "list", "--json"); !strings.Contains(out, "interaction_required") ||
+		!strings.Contains(out, "next_action") || opens != closes {
+		t.Fatalf("listing did not diagnose the missing profile offline: %s", out)
+	}
+	if out := run("", false, "ls", "/drive"); !strings.Contains(out, action) || !strings.Contains(out, "interaction_required") {
+		t.Fatalf("missing profile did not offer mount edit: %s", out)
+	}
+	if err := os.WriteFile(profile, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out := run("", false, "ls", "/drive"); strings.Contains(out, action) || !strings.Contains(out, "credential_unavailable") {
+		t.Fatalf("invalid profile was reported as missing: %s", out)
+	}
+	if err := os.Remove(profile); err != nil {
+		t.Fatal(err)
+	}
+	run("\ny\n", true, "mount", "edit", "/drive")
+	if candidate == profile || save().Digest != saved.Digest || opens != closes {
+		t.Fatal("recovery did not preserve the original mount and replace only its profile")
+	}
+	// A missing grant, or a Windows grant that this user cannot unprotect,
+	// requires confirmation of the newly authenticated account.
+	unreadable := []byte("fixture grant from a different user")
+	if goruntime.GOOS == "windows" {
+		err = os.WriteFile(lease.Path, unreadable, 0600)
+	} else {
+		err = os.Remove(lease.Path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := run("\ny\nn\n", false, "mount", "edit", "/drive"); !strings.Contains(out, "previous account could not be verified") ||
+		save().Digest != saved.Digest {
+		t.Fatalf("unverified old authorization did not require consent: %s", out)
+	}
+	assertGone(candidate)
+	run("\ny\ny\n", true, "mount", "edit", "/drive")
+	m := save().Value.Mounts[0]
+	if m.Credential.Ref == ref || !bytes.Equal(m.Options, saved.Value.Mounts[0].Options) || opens != closes {
+		t.Fatal("reconnect should replace only the selected credential reference")
+	}
+	if goruntime.GOOS == "windows" {
+		if content, err := os.ReadFile(lease.Path); err != nil || !bytes.Equal(content, unreadable) {
+			t.Fatalf("reconnect touched the unreadable grant: %v", err)
+		}
+	}
+
 	configBytes, err := os.ReadFile(config)
 	if err != nil {
 		t.Fatal(err)

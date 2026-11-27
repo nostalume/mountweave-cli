@@ -10,18 +10,20 @@ changes cover commands, saved settings, authorization and runtime assembly.
 From the checkout, use Go 1.27 or newer.
 
 ```sh
-GOWORK=off go build -mod=readonly -trimpath -o mweave .
+GOWORK=off go build -mod=readonly -tags=arrow_json_stdlib -trimpath -ldflags '-s -w' -o mweave .
 ```
 
 For PowerShell, set the workspace switch before building.
 
 ```powershell
 $env:GOWORK = 'off'
-go build -mod=readonly -trimpath -o mweave.exe .
+go build -mod=readonly -tags=arrow_json_stdlib -trimpath -ldflags '-s -w' -o mweave.exe .
 ```
 
-Run the executable by its path or add its directory to `PATH`. Add
-`-tags=mweave_pool` to include the optional [storage Pool](docs/sources.md#pool-mounts).
+Run the executable by its path or add its directory to `PATH`.
+`arrow_json_stdlib` matches the release build's JSON backend. Use
+`-tags=arrow_json_stdlib,mweave_pool` to include the optional
+[storage Pool](docs/sources.md#pool-mounts).
 
 ## Develop one change
 
@@ -31,7 +33,7 @@ Run the executable by its path or add its directory to `PATH`. Add
 | Saved mounts, credentials or recovery | [`mounts.go`](internal/cliapp/mounts.go), [`config.go`](internal/cliapp/config.go), [`mount_runtime.go`](internal/cliapp/mount_runtime.go) | `TestSelectedHost`, `TestConfigContenders`, `TestCredentialRecipientBeforeOpen` |
 | Source or consent flow | [Stock catalog](internal/stock/sources.go), [managed authorization](internal/cliapp/managed_setup.go) | `TestDefaultConnections`, [authorization fixtures](internal/stock/authorization_test.go), [website fixtures](internal/stock/website_test.go) |
 | Export scope, readiness or shutdown | [`export.go`](internal/cliapp/export.go), [`serve.go`](internal/cliapp/serve.go), the protocol adapter | `TestProtocolExports`, `TestExportListenerFailure`, `TestS3MultipartRestart` |
-| Private Pool members | [`pool_enabled.go`](internal/stock/pool_enabled.go) | `TestPoolMountWorkflow` with `-tags=mweave_pool` |
+| Private Pool members | [`pool_enabled.go`](internal/stock/pool_enabled.go) | `TestPoolMountWorkflow` with `-tags=arrow_json_stdlib,mweave_pool` |
 
 For example, when a service already exposes WebDAV, add a preset only if
 its default endpoint or setup differs. The `nutstore` preset reuses the
@@ -45,9 +47,10 @@ published dependency graph. Use `export GOWORK=off` in Bash or
 `$env:GOWORK = 'off'` in PowerShell. Format changed Go files with `gofmt`.
 
 ```sh
-go test -mod=readonly ./...
-go test -mod=readonly -tags=mweave_pool ./...
-go vet -mod=readonly ./...
+go test -mod=readonly -tags=arrow_json_stdlib ./...
+go vet -mod=readonly -tags=arrow_json_stdlib ./...
+go test -mod=readonly -tags=arrow_json_stdlib,mweave_pool ./...
+go vet -mod=readonly -tags=arrow_json_stdlib,mweave_pool ./...
 ```
 
 Use closed fixtures and dummy credentials. Prefer extending an existing
@@ -98,7 +101,7 @@ The S3 multipart check starts and restarts a separate host process using the
 test executable and a closed storage fixture.
 
 ```sh
-go test -mod=readonly -count=1 -v -run '^TestS3MultipartRestart$' ./internal/cliapp
+go test -mod=readonly -tags=arrow_json_stdlib -count=1 -v -run '^TestS3MultipartRestart$' ./internal/cliapp
 ```
 
 ## Prepare a release

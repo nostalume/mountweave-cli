@@ -76,22 +76,10 @@ func (s ConfigSnapshot) saveValidated(ctx context.Context) (applied bool, err er
 		return false, err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	stage, err := stageFile(filepath.Dir(s.Path), ".mweave-config-*", append(data, '\n'))
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		if !applied {
-			err = errors.Join(err, os.Remove(stage))
-		}
-	}()
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if err := replaceConfig(stage, s.Path, s.exists); err != nil {
-		return false, err
-	}
-	return true, nil
+	return publishStagedFile(ctx, s.Path, ".mweave-config-*", append(data, '\n'), func(stage string) (bool, error) {
+		err := replaceConfig(stage, s.Path, s.exists)
+		return err == nil, err
+	})
 }
 
 func (s ConfigSnapshot) LockUnchanged(ctx context.Context) (_ *os.File, err error) {
@@ -128,17 +116,26 @@ func (s ConfigSnapshot) LockUnchanged(ctx context.Context) (_ *os.File, err erro
 	return lock, nil
 }
 
-// stageFile syncs a private file before a caller publishes it in the same directory.
-func stageFile(dir, pattern string, data []byte) (string, error) {
-	temp, err := os.CreateTemp(dir, pattern)
+// publishStagedFile owns a private file until the native commit consumes it.
+func publishStagedFile(ctx context.Context, target, pattern string, data []byte, commit func(string) (bool, error)) (published bool, err error) {
+	file, err := os.CreateTemp(filepath.Dir(target), pattern)
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	if _, err := temp.Write(data); err != nil {
-		return "", errors.Join(err, temp.Close(), os.Remove(temp.Name()))
+	stage := file.Name()
+	defer func() {
+		if !published {
+			err = errors.Join(err, os.Remove(stage))
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return false, errors.Join(err, file.Close())
 	}
-	if err := errors.Join(temp.Sync(), temp.Close()); err != nil {
-		return "", errors.Join(err, os.Remove(temp.Name()))
+	if err := errors.Join(file.Sync(), file.Close()); err != nil {
+		return false, err
 	}
-	return temp.Name(), nil
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return commit(stage)
 }

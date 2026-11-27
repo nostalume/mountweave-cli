@@ -123,7 +123,10 @@ Switching accounts changes one mount. Restoring a missing grant preserves
 the saved folder and asks for confirmation when native verification cannot
 prove the old binding. See the [credential contract](configuration.md#editing-credentials).
 
-The host owns protected storage, leases, and publication. Reusable refresh
+Drivers own provider-specific authorization exchange and native account and
+root checks. Browser adapters own the provider's navigation constraints.
+The host supplies the browser, prompts and the credential store. The host
+owns protected storage, leases, and publication. Reusable refresh
 and app credentials share the access-token cache. On reauthorization,
 reusable grants take the writer lease after consent and recheck the current
 record. App credentials take it before the exchange. Static approvals stay

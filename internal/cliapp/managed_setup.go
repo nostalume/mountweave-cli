@@ -40,6 +40,7 @@ type ManagedAuthorization struct {
 	Provider, Label, Method string
 	Kind                    GrantKind
 	VerifyRoots             bool // Re-check native access if the grant does not report scope.
+	ConfigureBeforeGrant    bool // Mount options determine the authorization scopes.
 	ManagedOnly             bool
 	ReferenceInGrant        bool
 	Scopes                  func([]byte) ([]string, error)
@@ -132,7 +133,7 @@ func (p *ManagedAuthorization) selectGrant(ctx context.Context, ask Prompt, out 
 		return grantSelection{}, GrantUnavailable()
 	}
 	var choices []grantSelection
-	answers := []string{"authorize"}
+	var answers, labels []string
 	for _, entry := range entries {
 		id, ok := strings.CutSuffix(entry.Name(), ".grant")
 		if !ok || !ValidGrantID(id) {
@@ -144,43 +145,37 @@ func (p *ManagedAuthorization) selectGrant(ctx context.Context, ask Prompt, out 
 		}
 		choices = append(choices, grantSelection{ref: &CredentialRef{Kind: ManagedCredential, Ref: id}, label: g.Label})
 		answers = append(answers, strconv.Itoa(len(choices)))
-		var displayErr error
+		label := p.Label + " account"
 		if p.Kind == StaticGrant {
-			label := p.Label + " account"
 			if info, err := entry.Info(); err == nil {
 				label += " · saved " + info.ModTime().Local().Format("2006-01-02 15:04:05")
 			}
-			_, displayErr = fmt.Fprintf(out, "  %d  %s\n", len(choices), label)
 		} else {
-			_, displayErr = fmt.Fprintf(out, "%d  %q (app %q)\n", len(choices), g.Label, g.ClientID)
+			label = fmt.Sprintf("%q (app %q)", g.Label, g.ClientID)
 		}
-		if displayErr != nil {
-			return grantSelection{}, displayErr
-		}
+		labels = append(labels, label)
 	}
-	label, choice := p.Label+" authorization (Enter to start)", "authorize"
-	if len(choices) > 0 {
-		label, choice = p.Label+" authorization (saved authorization number or authorize)", ""
-		if len(choices) == 1 {
-			choice = "1"
-		}
+	answers = append(answers, "authorize")
+	labels = append(labels, "authorize   Authorize a new account")
+	label, choice := p.Label+" authorization", ""
+	switch {
+	case len(choices) == 1:
+		choice = "1"
+	case len(choices) == 0 && !allowReference:
+		label += " (Enter to start)"
+		choice = "authorize"
 	}
 	if allowReference {
 		answers = append(answers, "reference")
-		label = p.Label + " authorization (authorize an app or reference an access token)"
-		if len(choices) == 0 {
-			choice = ""
-		} else {
-			label = p.Label + " authorization (saved authorization number, authorize or reference)"
-		}
+		labels = append(labels, "reference   Use an access token reference")
 	}
 	if !reconnecting || len(choices) != 0 {
-		answer, err := AskChoice(ask, label, choice, answers...)
+		answer, err := askMenu(ask, label, choice, answers, labels)
 		if err != nil || answer == "reference" {
 			return grantSelection{}, err
 		}
 		if answer != "authorize" {
-			selected := choices[slices.Index(answers, answer)-1]
+			selected := choices[slices.Index(answers, answer)]
 			_, err := fmt.Fprintf(out, "Using saved %s authorization.\n", p.Label)
 			return selected, err
 		}
@@ -218,7 +213,7 @@ func (p *ManagedAuthorization) probeGrant(ctx context.Context, src MountSource, 
 	if p.Probe != nil {
 		return p.Probe(ctx, mount, grant)
 	}
-	d, err := src.Open(ctx, grant.Access)
+	d, err := constructDriver(ctx, src.Open, grant.Access)
 	return src.verifyAndClose(ctx, d, err)
 }
 
@@ -231,8 +226,8 @@ func (p *ManagedAuthorization) reauthorize(ctx context.Context, appCLI *App, sav
 	receipt := reauthorizeReceipt{Mounts: make([]string, 0, 1), AuthorizationEffect: core.Unchanged.String()}
 	scopes := old.Scopes
 	var shared []MountRecord
-	for mount := range SourceRecords(saved.Value.Mounts...) {
-		if mount.Credential == nil || mount.Credential.Kind != ManagedCredential || mount.Credential.Ref != old.ID {
+	for mount := range CredentialRecords(saved.Value.Mounts) {
+		if mount.Credential.Kind != ManagedCredential || mount.Credential.Ref != old.ID {
 			continue
 		}
 		if bound, _ := appCLI.mountRoute(mount); bound != selected {

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode"
@@ -24,39 +25,46 @@ import (
 // Main runs the process command line with terminal detection and signal cancellation.
 func (app *App) Main() int {
 	signal.Ignore(syscall.SIGPIPE)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
-	return app.Run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, term.IsTerminal(int(os.Stdin.Fd())))
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	return app.run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, term.IsTerminal(int(os.Stdin.Fd())), interrupts)
 }
 
 // Run executes one invocation using the supplied streams and cancellation context.
 func (app *App) Run(ctx context.Context, argv []string, in io.Reader, out, diagnostics io.Writer, terminal bool) int {
-	a, command, err := parse(argv)
+	return app.run(ctx, argv, in, out, diagnostics, terminal, nil)
+}
+
+func (app *App) run(ctx context.Context, argv []string, in io.Reader, out, diagnostics io.Writer, terminal bool, interrupts <-chan os.Signal) int {
+	a, err := parse(argv)
 	if err != nil {
 		// Option parsing can fail before it sees the requested output mode.
-		for _, arg := range argv {
-			if arg == "--" {
-				break
-			}
-			a.json = a.json || arg == "--json"
+		if jsonAt := slices.Index(argv, "--json"); !a.json && jsonAt >= 0 {
+			end := slices.Index(argv, "--")
+			a.json = end < 0 || jsonAt < end
 		}
 		return app.respond(a.json, out, diagnostics, nil, "", err)
 	}
 	if a.help {
-		text := app.helpText(a, command)
+		text := app.helpText(a)
 		return app.respond(a.json, out, diagnostics, text, text, nil)
 	}
-	if a.command == "version" {
+	if a.command.name == "version" {
 		version := "devel"
 		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "(devel)" && info.Main.Version != "" {
 			version = info.Main.Version
 		}
 		return app.respond(a.json, out, diagnostics, version, "mweave "+version+"\n", nil)
 	}
-	if a.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, a.timeout)
+	if a.command.name != "shell" {
+		var cancel func()
+		ctx, cancel = commandContext(ctx, interrupts, a.timeout)
 		defer cancel()
+	} else if !terminal || in == nil {
+		return app.respond(false, out, diagnostics, nil, "", &Problem{Code: "interaction_required", Message: "Shell requires a terminal."})
 	}
 	if a.config == "" {
 		a.config, err = DefaultConfigPath()
@@ -64,24 +72,26 @@ func (app *App) Run(ctx context.Context, argv []string, in io.Reader, out, diagn
 			return app.respond(a.json, out, diagnostics, nil, "", &Problem{Code: "invalid_config", Message: "The user configuration directory is unavailable.", NextAction: "Provide --config FILE."})
 		}
 	}
-	if (a.json || !terminal) && a.from == "" && slices.Contains(command.options, fromOption) {
+	if (a.json || !terminal) && a.from == "" && slices.Contains(a.command.options, fromOption) {
 		return app.respond(a.json, out, diagnostics, nil, "", &Problem{Code: "interaction_required", Message: "Setup requires a terminal or a configuration record.", NextAction: "Provide a record with --from FILE or --from -."})
 	}
 	saved, err := LoadConfig(a.config)
 	if err != nil {
 		return app.respond(a.json, out, diagnostics, nil, "", err)
 	}
-	switch {
-	case a.command == "serve":
+	switch a.commandWords[0] {
+	case "serve":
 		return app.runServe(ctx, saved, a.json, out, diagnostics)
-	case a.command == "export add":
+	case "export":
 		result, line, err := addExport(ctx, saved, a, in, diagnostics)
 		return app.respond(a.json, out, diagnostics, result, line, err)
-	case strings.HasPrefix(a.command, "mount "):
+	case "mount":
 		result, line, err := app.runMount(ctx, saved, a, in, diagnostics)
 		return app.respond(a.json, out, diagnostics, result, line, err)
+	case "shell":
+		return app.runShell(ctx, saved, a, in, out, diagnostics, interrupts)
 	default:
-		return app.runFile(ctx, saved, a, in, out, diagnostics)
+		return app.runFile(ctx, saved, a, in, out, diagnostics, nil)
 	}
 }
 
@@ -89,19 +99,11 @@ func readRecord(ctx context.Context, name string, in io.Reader) (_ []byte, err e
 	if name != "-" {
 		return os.ReadFile(name)
 	}
-	if file, ok := in.(*os.File); ok {
-		pipe, release, setupErr := pollablePipe(file)
-		if setupErr != nil {
-			return nil, setupErr
-		}
-		if release != nil {
-			defer func() { err = errors.Join(err, release()) }()
-		}
-		in = pipe
+	in, finish, err := prepareStream(ctx, in, true)
+	if err != nil {
+		return nil, err
 	}
-	if closer, ok := in.(io.Closer); ok {
-		defer closeOnCancel(ctx, closer)()
-	}
+	defer finish(&err)
 	return io.ReadAll(in)
 }
 
@@ -187,6 +189,31 @@ func AskCredentialReference(ask Prompt, label string, prior *CredentialRef,
 }
 
 func AskChoice(ask Prompt, label, current string, choices ...string) (string, error) {
+	return askChoice(ask, label, current, choices, false)
+}
+
+func AskMenu(ask Prompt, label, current string, choices ...string) (string, error) {
+	return askMenu(ask, label, current, choices, nil)
+}
+
+func askMenu(ask Prompt, label, current string, choices, labels []string) (string, error) {
+	var menu strings.Builder
+	if len(choices) > 1 {
+		for i, choice := range choices {
+			if labels != nil {
+				choice = labels[i]
+			}
+			fmt.Fprintf(&menu, "  %d. %s\n", i+1, choice)
+		}
+		if i := slices.Index(choices, current); i >= 0 {
+			current = strconv.Itoa(i + 1)
+		}
+	}
+	menu.WriteString(label)
+	return askChoice(ask, menu.String(), current, choices, true)
+}
+
+func askChoice(ask Prompt, label, current string, choices []string, numbered bool) (string, error) {
 	prompt := label
 	for {
 		answer, err := ask(prompt, current)
@@ -196,6 +223,11 @@ func AskChoice(ask Prompt, label, current string, choices ...string) (string, er
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if slices.Contains(choices, answer) {
 			return answer, nil
+		}
+		if numbered {
+			if n, err := strconv.Atoi(answer); err == nil && n > 0 && n <= len(choices) {
+				return choices[n-1], nil
+			}
 		}
 		prompt = "Invalid choice. Try again.\n" + label
 	}

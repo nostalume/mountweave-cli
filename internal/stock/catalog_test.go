@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	localsource "github.com/nostalume/mountweave-cli/cli/source/local"
 	"github.com/nostalume/mountweave-cli/internal/cliapp"
 )
 
@@ -67,6 +68,9 @@ func TestDefaultConnections(t *testing.T) {
 	cases := []struct {
 		id, connection, options, origin, location string
 	}{
+		{"baidupan", "", `{"root_path":"/Archive"}`, "https://pan.baidu.com", ""},
+		{"baidupan", "open", `{"root_path":"/Archive"}`, "https://pan.baidu.com", ""},
+		{"pan115", "", `{"root_id":"42"}`, "Authorization https://proapi.115.com", ""},
 		{"pan123", "", `{"root_id":"42"}`, "Authorization https://open-api.123pan.com", "Folder ID 42"},
 		{"pan123", "website", `{"root":"/"}`, "https://yun.123pan.cn/", ""},
 		{"pan123", "webdav", `{"root_url":"https://example.test/webdav/","username":"reader"}`, "webdav https example.test 443", "https://example.test/webdav/"},
@@ -74,6 +78,8 @@ func TestDefaultConnections(t *testing.T) {
 		{"alipan-web", "", `{"account":"fixture","drive_id":"resource","root_id":"root"}`, "https://www.alipan.com/drive", ""},
 		{"githubrepo", "", `{"repository":"example/tree","ref":"main"}`, "Authorization https://api.github.com", ""},
 		{"atomgit", "", `{"repository":"example/tree","ref":"main"}`, "Authorization https://api.atomgit.com", ""},
+		{"guangyapan", "", `{"client_id":"fixture"}`, "Authorization https://openapi.guangyapan.com", ""},
+		{"guangyapan", "open", `{"client_id":"fixture"}`, "Authorization https://openapi.guangyapan.com", ""},
 	}
 	for _, tc := range cases {
 		src, err := cliapp.PrepareMountSource(testApp, cliapp.MountRecord{At: "/files", Driver: tc.id, Connection: tc.connection, Options: json.RawMessage(tc.options)}, t.TempDir())
@@ -81,23 +87,74 @@ func TestDefaultConnections(t *testing.T) {
 			t.Errorf("%s/%s: origin %q, location %q, error %v", tc.id, tc.connection, src.Audience.Origin, src.Location.Location, err)
 		}
 	}
-	if r := s3Presets["r2"]; r.Region != "auto" || r.Endpoint != "" {
-		t.Fatalf("R2 defaults: %+v", r)
+	for _, tc := range []struct {
+		id, origin string
+		route      *cliapp.Route
+	}{
+		{"baidupan", "https://pan.baidu.com/disk/main", baiduWebsiteRoute()},
+		{"pan115", "https://f.115.com/", pan115WebsiteRoute()},
+		{"mediafire", "https://app.mediafire.com/", mediaFireWebsiteRoute()},
+		{"guangyapan", "https://www.guangyapan.com/#/home/all", guangyaWebsiteRoute()},
+		{"tianyipan", "https://cloud.189.cn/web/login.html", tianyiWebsiteRoute()},
+	} {
+		website, err := cliapp.PrepareMountSource(testApp, cliapp.MountRecord{
+			At: "/files", Driver: tc.id, Connection: "website", Options: json.RawMessage(`{"root":"/Archive"}`),
+		}, t.TempDir())
+		if tc.route == nil {
+			if err == nil || cliapp.AppProblem(testApp, err).Code != "mount_unavailable" {
+				t.Fatalf("%s website unavailable build: %v", tc.id, err)
+			}
+		} else if err != nil || website.OpenManaged == nil || website.Audience.Origin != tc.origin {
+			t.Fatalf("%s website route: audience %+v, open configured %t (%v)", tc.id, website.Audience, website.OpenManaged != nil, err)
+		}
 	}
-	if r := s3Presets["cos"]; !r.ListV1 || r.Region != "ap-guangzhou" {
-		t.Fatalf("COS defaults: %+v", r)
+	r2, cos := s3Presets["r2"], s3Presets["cos"]
+	if r2.Region != "auto" || r2.Endpoint != "" || !cos.ListV1 || cos.Region != "ap-guangzhou" {
+		t.Fatalf("S3 defaults: R2 %+v, COS %+v", r2, cos)
 	}
 	named, err := prepareS3(s3Options{Bucket: "files", Region: "local", Endpoint: "http://127.0.0.1:9000"}, "")
 	if err != nil || named.Mode != cliapp.SDKNamedProfile || named.Audience.Origin != "http://127.0.0.1:9000" {
 		t.Fatalf("custom S3 profile: %+v (%v)", named.Audience, err)
 	}
-	sftp, err := prepareSFTP(sftpOptions{Address: "127.0.0.1", Username: "fixture", KnownHosts: "missing_hosts"}, t.TempDir())
+	const edit = `{"at":"/nas","driver":"sftp","options":{"address":"127.0.0.1","username":"fixture","known_hosts":"missing_hosts","identity_file":"key"}`
+	const ref = `,"credential":{"kind":"env","ref":"TEST_SFTP_KEY"}`
+	cfg := filepath.Join(t.TempDir(), "config.json")
+	before := `{"version":1,"mounts":[` + edit + ref + `}]}`
+	writeFixture(t, cfg, []byte(before))
+	result := invokeCLI(t, cfg, edit+`,"credential":null}`, false, 1, "mount", "edit", "/nas", "--from", "-", "--json")
+	if after, err := os.ReadFile(cfg); err != nil || string(after) != before || result.Error == nil || result.Error.Code != "host_key_unavailable" {
+		t.Fatalf("clearing an SSH passphrase must verify host trust and preserve the old record on failure: %+v (%v)", result.Error, err)
+	}
+}
+
+func TestNumberedMountChoices(t *testing.T) {
+	local, _ := cliapp.ConnectionFor(localsource.Source(), "")
+	first, second := local, local
+	first.Method, second.Method = "first", "second"
+	app, err := cliapp.NewApp(nil,
+		cliapp.SingleSource("fixture-alpha", "Local folders", *local.Route),
+		cliapp.ServiceSource("fixture-bravo", "Personal archive", first, second),
+		cliapp.SingleSource("fixture-charlie", "Shared archive", *local.Route),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = sftp.Open(t.Context(), "sealed-password")
-	if problem, ok := err.(*cliapp.Problem); !ok || problem.Code != "host_key_unavailable" {
-		t.Fatalf("SFTP opened without loading host trust: %v", err)
+	cfg := filepath.Join(t.TempDir(), "config.json")
+	input := strings.NewReader("?\narchive\n0\n1\n9\n2\n" + t.TempDir() + "\ny\n")
+	var diagnostics bytes.Buffer
+	args := []string{"--config", cfg, "mount", "add", "/archive"}
+	if code := app.Run(t.Context(), args, input, &bytes.Buffer{}, &diagnostics, true); code != 0 {
+		t.Fatalf("exit %d: %s", code, &diagnostics)
+	}
+	saved, err := cliapp.LoadConfig(cfg)
+	if err != nil || len(saved.Value.Mounts) != 1 ||
+		saved.Value.Mounts[0].Driver != "fixture-bravo" || saved.Value.Mounts[0].Connection != "second" {
+		t.Fatalf("numbered mount: %+v (%v)", saved.Value.Mounts, err)
+	}
+	for _, want := range []string{"1. fixture-alpha", "1. fixture-bravo", "2. second"} {
+		if !strings.Contains(diagnostics.String(), want) {
+			t.Fatalf("missing %q in %s", want, &diagnostics)
+		}
 	}
 }
 

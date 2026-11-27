@@ -11,26 +11,56 @@ import (
 	"github.com/nostalume/mountweave/drivers/alipan"
 	"github.com/nostalume/mountweave/drivers/lanzou"
 	"github.com/nostalume/mountweave/drivers/mobilepan"
+	"github.com/nostalume/mountweave/drivers/pan123"
+	pan123cdp "github.com/nostalume/mountweave/drivers/pan123/cdp"
 	"github.com/nostalume/mountweave/drivers/quark"
 	quarkcdp "github.com/nostalume/mountweave/drivers/quark/cdp"
 	"github.com/nostalume/mountweave/drivers/uc"
 )
 
+func pan123WebsiteRoute() *cliapp.Route {
+	const entry = pan123cdp.Origin + "/"
+	source := websiteSource{
+		ID: "pan123", Name: "123 Cloud Drive", Entry: entry,
+		SignIn: pan123.ErrWebsiteSignIn, BindingMismatch: pan123.ErrWebsiteBindingMismatch,
+	}
+	route := source.withPage(entry, false, func(page websitePage) websiteSession {
+		session := pan123cdp.New(page.Tab)
+		return websiteSession{
+			Account: session.Account,
+			Mount: func(ctx context.Context, account, root, rootID string, release func() error) (websiteDriver, error) {
+				return pan123.OpenWebsite(ctx, pan123.WebsiteOptions{
+					Session: session, Account: account, RootPath: root, RootID: rootID,
+					ContentClient: storageHTTPClient, Release: release,
+				})
+			},
+		}
+	}).route()
+	return &route
+}
+
 func mobilePanWebsiteRoute() cliapp.Route {
 	source := websiteSource{
 		ID: cliapp.MobilePanSource, Name: "China Mobile Cloud", Entry: mobilepan.WebsiteURL,
+		Access: "Browse, download, upload and create directories",
 		SignIn: mobilepan.ErrWebsiteSignIn, BindingMismatch: mobilepan.ErrWebsiteBindingMismatch,
 	}
-	return source.pageRoute(mobilepan.WebsiteURL, false, func(page websitePage) websiteSession {
+	return source.withPage(mobilepan.WebsiteURL, false, func(page websitePage) websiteSession {
 		return websiteSession{
 			Account: (mobilepan.Website{Call: page.Call}).AccountID,
 			Mount: func(ctx context.Context, account, root, rootID string, release func() error) (websiteDriver, error) {
-				session := mobilepan.Website{Call: page.Call, ExpectedRootID: rootID, Release: release}
+				directory, err := websiteUploadDirectory()
+				if err != nil {
+					return nil, err
+				}
+				session := mobilepan.Website{
+					Call: page.Call, ExpectedRootID: rootID, Release: release,
+					Upload: &mobilepan.WebsiteUploadOptions{StagingDirectory: directory, MaxStagingBytes: maxWebsiteStagingBytes},
+				}
 				return session.Open(ctx, account, root, storageHTTPClient)
 			},
-			Close: page.Release,
 		}
-	})
+	}).route()
 }
 
 func ucWebsiteRoute() cliapp.Route {
@@ -38,7 +68,7 @@ func ucWebsiteRoute() cliapp.Route {
 		ID: cliapp.UcSource, Name: "UC Cloud Drive", Entry: uc.WebsiteURL,
 		SignIn: uc.ErrWebsiteSignIn, BindingMismatch: uc.ErrWebsiteBindingMismatch,
 	}
-	return source.pageRoute(uc.WebsiteURL, true, func(page websitePage) websiteSession {
+	return source.withPage(uc.WebsiteURL, true, func(page websitePage) websiteSession {
 		return websiteSession{
 			Account: func(ctx context.Context) (string, error) { return uc.WebsiteAccount(ctx, page.Call) },
 			Mount: func(ctx context.Context, account, root, rootID string, release func() error) (websiteDriver, error) {
@@ -46,9 +76,8 @@ func ucWebsiteRoute() cliapp.Route {
 					Call: page.Call, Tab: page.Tab, Account: account, RootPath: root, RootID: rootID, Release: release,
 				})
 			},
-			Close: page.Release,
 		}
-	})
+	}).route()
 }
 
 func quarkWebsiteRoute() cliapp.Route {
@@ -56,12 +85,12 @@ func quarkWebsiteRoute() cliapp.Route {
 		ID: cliapp.QuarkSource, Name: "Quark Cloud Drive", Entry: quark.WebsiteOrigin + "/",
 		SignIn: quark.ErrWebsiteSignIn, BindingMismatch: quark.ErrWebsiteBindingMismatch,
 	}
-	return source.pageRoute(quark.WebsiteOrigin+"/list", false, func(page websitePage) websiteSession {
-		return quarkWebsiteSession(page.Call, quarkcdp.Transfer(page.Tab), page.Release)
-	})
+	return source.withPage(quark.WebsiteOrigin+"/list", false, func(page websitePage) websiteSession {
+		return quarkWebsiteSession(page.Call, quarkcdp.Transfer(page.Tab))
+	}).route()
 }
 
-func quarkWebsiteSession(call quark.WebsiteCall, transfer quark.WebsiteTransfer, closeSite func() error) websiteSession {
+func quarkWebsiteSession(call quark.WebsiteCall, transfer quark.WebsiteTransfer) websiteSession {
 	return websiteSession{
 		Account: func(ctx context.Context) (string, error) { return quark.WebsiteAccount(ctx, call) },
 		Mount: func(ctx context.Context, account, root, rootID string, release func() error) (websiteDriver, error) {
@@ -69,7 +98,6 @@ func quarkWebsiteSession(call quark.WebsiteCall, transfer quark.WebsiteTransfer,
 				Call: call, Transfer: transfer, Account: account, RootPath: root, RootID: rootID, Release: release,
 			})
 		},
-		Close: closeSite,
 	}
 }
 
@@ -92,7 +120,7 @@ func lanZouWebsiteRoute() cliapp.Route {
 	r := cliapp.SourceRoute(nil, prepareLanZouWebsite)
 	r.SignIn, r.BindingMismatch = lanzou.ErrWebsiteSignIn, lanzou.ErrWebsiteBindingMismatch
 	r.SignInProblem = &cliapp.Problem{Code: string(core.UpstreamAccessDenied), Message: "The LanZou sign-in has expired.", NextAction: "Sign in again.", Reconnect: true}
-	return attachWebsiteSetup(r, websiteLogin{Driver: cliapp.LanZouSource, Name: "LanZou Cloud", Entry: lanzou.LoginURL, ReplaceReference: true}, restoreLanZou, verifyLanZou)
+	return attachWebsiteSetup(r, websiteLogin{Name: "LanZou Cloud", Entry: lanzou.LoginURL, ReplaceReference: true}, restoreLanZou, verifyLanZou)
 }
 
 func prepareLanZouWebsite(opts lanZouOptions, _ string) (cliapp.MountSource, error) {
@@ -145,15 +173,12 @@ func verifyLanZou(ctx context.Context, candidate *websiteCandidate, bound lanZou
 	return websiteSelection{Options: lanZouOptions{Root: root}, Grant: lanZouGrant{cliapp.LanZouSource, d.Account(), root}, Folder: folder}, nil
 }
 
-// The sign-in page saves the session before navigating to back. Land on a
-// static document so the uninstrumented window does not load the drive app.
-const aliPanWebsiteLogin = "https://www.alipan.com/sign/in?back=%2Frobots.txt"
-
 func aliPanWebsiteRoute() cliapp.Route {
 	r := cliapp.SourceRoute(nil, prepareAliPanWebsite)
 	r.SignIn, r.SignInProblem = alipan.ErrWebsiteSignIn, websiteSignInProblem("Aliyun Drive")
+	r.BindingMismatch = alipan.ErrWebsiteBindingMismatch
 	return attachWebsiteSetup(r, websiteLogin{
-		Driver: "alipan", Connection: "website", Name: "Aliyun Drive", Entry: aliPanWebsiteLogin, SeparateGrantID: true,
+		Name: "Aliyun Drive", Entry: alipan.WebsiteLoginURL, SeparateGrantID: true,
 		Instructions: "Close the sign-in window when the plain text page appears.",
 	}, restoreAliPan, verifyAliPan)
 }
@@ -191,7 +216,7 @@ func verifyAliPan(ctx context.Context, candidate *websiteCandidate, options aliP
 	var folder string
 	if candidate.Existing {
 		if account.ID != options.Account || account.ResourceDrive != options.Drive {
-			return websiteSelection{}, cliapp.AuthorizationScopeConflict()
+			return websiteSelection{}, cliapp.WebsiteMountScopeConflict()
 		}
 		// Verify sibling roots before the edited root, once per root ID.
 		if candidate.Shared != nil {
@@ -344,16 +369,7 @@ func openAliPanWebsiteMount(ctx context.Context, id string, opts aliPanWebsiteOp
 }
 
 func (s *aliPanWebsiteSession) open(ctx context.Context, opts aliPanWebsiteOptions, release func() error) (core.Driver, error) {
-	if s.account.ID != opts.Account || s.account.ResourceDrive != opts.Drive {
-		return nil, errors.Join(cliapp.AuthorizationScopeConflict(), release())
-	}
-	var d core.Driver
-	var err error
-	if opts.Write == nil {
-		d, _, err = s.account.Open(ctx, opts.RootID, "", nil, release)
-	} else {
-		d, err = s.account.OpenWritable(ctx, opts.RootID, *opts.Write, nil, release)
-	}
+	d, err := s.account.OpenBound(ctx, opts.Account, opts.Drive, opts.RootID, opts.Write, nil, release)
 	if err != nil {
 		return nil, errors.Join(err, release())
 	}

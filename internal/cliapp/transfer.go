@@ -27,23 +27,14 @@ func download(ctx context.Context, c *core.Core, source core.Address, dest strin
 		return change, err
 	}
 	if dest == "-" {
-		if file, ok := out.(*os.File); ok {
-			pipe, release, setupErr := pollablePipe(file)
-			if setupErr != nil {
-				return change, errors.Join(setupErr, content.Body.Close())
-			}
-			if release != nil {
-				defer func() { err = errors.Join(err, release()) }()
-			}
-			out = pipe
+		out, finish, setupErr := prepareStream(ctx, out, true)
+		if setupErr != nil {
+			return change, errors.Join(setupErr, content.Body.Close())
 		}
-		if closer, ok := out.(io.Closer); ok {
-			defer closeOnCancel(ctx, closer)()
-		}
-		err = copyDownload(outputBody{out}, content)
-		if err != nil {
-			if ctx.Err() != nil {
-				err = ctx.Err()
+		defer finish(&err)
+		if err = copyDownload(outputBody{out}, content); err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				err = canceled
 			}
 			cancel()
 		}
@@ -80,7 +71,10 @@ func download(ctx context.Context, c *core.Core, source core.Address, dest strin
 func copyDownload(w io.Writer, content core.Content) error {
 	n, err := io.Copy(w, content.Body)
 	if err == nil && content.Length != nil && n != *content.Length {
-		return core.Fail(core.InvalidUpstreamResponse, io.ErrUnexpectedEOF)
+		err = io.ErrUnexpectedEOF
+	}
+	if err == io.ErrUnexpectedEOF {
+		return core.Fail(core.InvalidUpstreamResponse, err)
 	}
 	return err
 }
@@ -95,25 +89,24 @@ func (w outputBody) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func upload(ctx context.Context, c *core.Core, target core.Address, input string, in io.Reader, length *int64, write core.WriteOptions) (change core.Change, err error) {
+func upload(ctx context.Context, c *core.Core, target core.Address, inDirectory bool, input string, in io.Reader, length *int64, write core.WriteOptions) (destination core.Address, change core.Change, err error) {
 	change.Effect = core.Unchanged
 	if input != "-" {
 		file, err := os.Open(input)
 		if err != nil {
-			return change, err
+			return destination, change, err
 		}
 		defer func() {
-			closeErr := file.Close()
-			if !errors.Is(closeErr, os.ErrClosed) {
+			if closeErr := file.Close(); !errors.Is(closeErr, os.ErrClosed) {
 				err = errors.Join(err, closeErr)
 			}
 		}()
 		info, err := file.Stat()
 		if err != nil {
-			return change, err
+			return destination, change, err
 		}
 		if info.IsDir() {
-			return change, core.Fail(core.NotFile, nil)
+			return destination, change, core.Fail(core.NotFile, nil)
 		}
 		if info.Mode().IsRegular() {
 			n := info.Size()
@@ -121,29 +114,48 @@ func upload(ctx context.Context, c *core.Core, target core.Address, input string
 		}
 		in = file
 	}
-	if input == "-" {
-		if file, ok := in.(*os.File); ok {
-			pipe, release, setupErr := pollablePipe(file)
-			if setupErr != nil {
-				return change, setupErr
-			}
-			if release != nil {
-				defer func() { err = errors.Join(err, release()) }()
-			}
-			in = pipe
-		}
+	in, finish, err := prepareStream(ctx, in, input == "-")
+	if err != nil {
+		return destination, change, err
 	}
-	if closer, ok := in.(io.Closer); ok {
-		defer closeOnCancel(ctx, closer)()
+	defer finish(&err)
+	if inDirectory {
+		destination, change, err = c.WriteInto(ctx, LocalActor, target, filepath.Base(input), in, length)
+	} else {
+		change, err = c.Write(ctx, LocalActor, target, in, length, write)
 	}
-	change, err = c.Write(ctx, LocalActor, target, in, length, write)
 	if err != nil {
 		err = errors.Join(ctx.Err(), err)
 	}
-	return change, err
+	return destination, change, err
 }
 
-func closeOnCancel(ctx context.Context, closer io.Closer) func() {
+// prepareStream joins cancellation before restoring any borrowed pipe flags.
+func prepareStream[T any](ctx context.Context, stream T, poll bool) (T, func(*error), error) {
+	var release func() error
+	if file, ok := any(stream).(*os.File); ok && poll {
+		pipe, done, err := pollablePipe(file)
+		if err != nil {
+			return stream, nil, err
+		}
+		stream, release = any(pipe).(T), done
+	}
+	stop := closeOnCancel(ctx, stream)
+	return stream, func(err *error) {
+		stop()
+		if release != nil {
+			if restore := release(); restore != nil && err != nil {
+				*err = errors.Join(*err, restore)
+			}
+		}
+	}, nil
+}
+
+func closeOnCancel(ctx context.Context, stream any) func() {
+	closer, ok := stream.(io.Closer)
+	if !ok {
+		return func() {}
+	}
 	done := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		_ = closer.Close()

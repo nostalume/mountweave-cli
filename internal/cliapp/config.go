@@ -87,10 +87,9 @@ func (c Config) validate() error {
 		if listeners[e.Listen] {
 			return InvalidConfig("Export listeners must be unique.")
 		}
-		if core.ValidatePath(e.Root) != nil || !slices.ContainsFunc(paths, func(m string) bool {
-			return e.containsMount(m)
-		}) {
-			if e.Protocol == "s3" {
+		scope := e.scope()
+		if core.ValidatePath(scope.root) != nil || !slices.ContainsFunc(paths, scope.containsMount) {
+			if scope.keys {
 				return InvalidConfig("An S3 export root must be the exact path of a saved object mount.")
 			}
 			return InvalidConfig("An export root must be within a saved mount.")
@@ -199,7 +198,7 @@ func savedSource(m MountRecord) (id, method string) {
 		switch m.Driver {
 		case AliPanWebsiteSource:
 			return "alipan", "website"
-		case "alipan", "pan123":
+		case "alipan", "baidupan", "guangyapan", "pan115", "pan123":
 			return m.Driver, "open"
 		}
 	}

@@ -28,7 +28,7 @@ import (
 	"github.com/nostalume/mountweave/drivers/uc"
 )
 
-func websiteTestApp(t *testing.T, login string) (string, func(string, bool, ...string), func() cliapp.ConfigSnapshot) {
+func websiteTestApp(t *testing.T, login string, app *cliapp.App) (string, func(string, bool, ...string) string, func() cliapp.ConfigSnapshot) {
 	t.Helper()
 	if !cliapp.ManagedStoreSupported {
 		t.Skip("managed storage is unavailable")
@@ -42,13 +42,14 @@ func websiteTestApp(t *testing.T, login string) (string, func(string, bool, ...s
 		}
 		return cliapp.Confirm(ask, "Continue?")
 	}
-	run := func(input string, ok bool, args ...string) {
+	run := func(input string, ok bool, args ...string) string {
 		t.Helper()
 		var result bytes.Buffer
-		code := testApp.Run(t.Context(), append([]string{"--config", config}, args...), strings.NewReader(input), &result, &result, true)
+		code := app.Run(t.Context(), append([]string{"--config", config}, args...), strings.NewReader(input), &result, &result, true)
 		if (code == 0) != ok {
 			t.Fatalf("%v => %d: %s", args, code, result.String())
 		}
+		return result.String()
 	}
 	snapshot := func() cliapp.ConfigSnapshot {
 		t.Helper()
@@ -62,12 +63,14 @@ func websiteTestApp(t *testing.T, login string) (string, func(string, bool, ...s
 }
 
 func TestAliPanSharedWebsiteGrant(t *testing.T) {
-	_, run, snapshot := websiteTestApp(t, aliPanWebsiteLogin)
+	config, run, snapshot := websiteTestApp(t, alipan.WebsiteLoginURL, testApp)
 	old := openAliPanWebsite
 	t.Cleanup(func() { openAliPanWebsite = old })
 	launches, releases := 0, 0
 	var sharedRef string
 	var refuseSibling bool
+	const originalAccount = `{"value":{"user_id":"fixture","resource_drive_id":"resource"}}`
+	accountReply := originalAccount
 	openAliPanWebsite = func(_ context.Context, _ string, _ []chromedp.ExecAllocatorOption, profile string) (alipan.Website, error) {
 		if err := website.PrivateDirectory(profile, false); err != nil {
 			return alipan.Website{}, err
@@ -95,7 +98,7 @@ func TestAliPanSharedWebsiteGrant(t *testing.T) {
 				const folder = `{"file_id":"archive","drive_id":"resource","parent_file_id":"root","name":"Archive","type":"folder"}`
 				switch request.Operation {
 				case "account":
-					return json.RawMessage(`{"value":{"user_id":"fixture","resource_drive_id":"resource"}}`), nil
+					return json.RawMessage(accountReply), nil
 				case "file":
 					return json.RawMessage(`{"value":` + folder + `}`), nil
 				case "page":
@@ -145,20 +148,51 @@ func TestAliPanSharedWebsiteGrant(t *testing.T) {
 		return record.Profile
 	}
 	original := profile()
+	const replacedAccount = `{"value":{"user_id":"different","resource_drive_id":"resource"}}`
+	for _, failure := range []struct {
+		reply, code string
+		reconnect   bool
+	}{
+		{replacedAccount, "credential_scope_conflict", true},
+		{`{"sign_in":true}`, "interaction_required", true},
+		{`{"status":403}`, string(core.UpstreamAccessDenied), false},
+	} {
+		accountReply = failure.reply
+		got := invokeCLI(t, config, "", false, 1, "ls", "/Archive", "--json")
+		if got.Error == nil || got.Error.Code != failure.code ||
+			strings.Contains(got.Error.NextAction, cliapp.MountEditAction(cfg.Path, "/Archive")) != failure.reconnect {
+			t.Errorf("website failure %s: got %+v, want %s with reconnect=%t", failure.reply, got.Error, failure.code, failure.reconnect)
+		}
+	}
+	accountReply = replacedAccount
+	output := run("2\ny\n", false, "mount", "edit", "/Archive")
+	if !strings.Contains(output, cliapp.WebsiteMountScopeConflict().Message) {
+		t.Errorf("editing with a different website account returned the wrong diagnostic: %s", output)
+	}
+	if profile() != original || snapshot().Digest != cfg.Digest || launches != releases {
+		t.Error("editing with a different website account should preserve the saved binding and release the candidate")
+	}
+	accountReply = originalAccount
 	refuseSibling = true
-	run("y\n", false, "mount", "edit", "/Archive")
+	run("2\ny\n", false, "mount", "edit", "/Archive")
 	if profile() != original {
 		t.Fatal("a failed sibling proof published the candidate")
 	}
 	refuseSibling = false
-	run("y\n", true, "mount", "edit", "/Archive")
+	run("2\ny\n", true, "mount", "edit", "/Archive")
 	if profile() == original || snapshot().Digest != cfg.Digest || launches != releases {
 		t.Fatal("reconnecting changed the saved roots or retained an extra browser")
 	}
 }
 
 func TestLanZouWebsiteReceipt(t *testing.T) {
-	config, run, snapshot := websiteTestApp(t, lanzou.LoginURL)
+	websiteRoute := lanZouWebsiteRoute()
+	app, err := cliapp.NewApp(nil, cliapp.ServiceSource(cliapp.LanZouSource, "LanZou Cloud",
+		cliapp.SourceConnection{Method: "website", Route: &websiteRoute}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, run, snapshot := websiteTestApp(t, lanzou.LoginURL, app)
 	old := openLanZouWebsite
 	t.Cleanup(func() { openLanZouWebsite = old })
 	wrongAction := false
@@ -225,10 +259,11 @@ func TestLanZouWebsiteReceipt(t *testing.T) {
 	if err := cliapp.DecodeObject(saved.Options, &options); err != nil || options.Root != "42" {
 		t.Fatalf("expected native root ID 42: %s, %v", saved.Options, err)
 	}
-	run("y\n", true, "mount", "edit", "/drive")
+	run("2\ny\n", true, "mount", "edit", "/drive")
 	reopened := snapshot().Value.Mounts[0]
-	if saved.Credential.Ref == reopened.Credential.Ref || !bytes.Equal(saved.Options, reopened.Options) {
-		t.Fatal("LanZou reconnect must replace the reference and keep the root ID")
+	if saved.Connection != "website" || reopened.Connection != saved.Connection ||
+		saved.Credential.Ref == reopened.Credential.Ref || !bytes.Equal(saved.Options, reopened.Options) {
+		t.Fatal("LanZou reconnect must replace the reference and keep the connection and root ID")
 	}
 	dest := filepath.Join(filepath.Dir(config), "download")
 	run("", true, "get", "/drive/note.txt", dest)
@@ -267,7 +302,7 @@ func readWebsiteBody(t *testing.T, body io.ReadCloser, err error, want string) {
 func TestUCWebsiteTransfer(t *testing.T) {
 	binary, options := websiteFixtureBrowser(t)
 	var preflights, grantCalls, bodyCalls, uiPageLoads atomic.Int32
-	var ignoredRange, stalledBody atomic.Bool
+	var ignoredRange, stalledBody, shortBody atomic.Bool
 	var keptSession, keptReferrer atomic.Bool
 	bodyCancelled := make(chan struct{}, 1)
 	grant := httptest.NewUnstartedServer(nil)
@@ -297,7 +332,11 @@ func TestUCWebsiteTransfer(t *testing.T) {
 				bodyCancelled <- struct{}{}
 				return
 			}
-			_, _ = io.WriteString(w, "sample")
+			body := "sample"
+			if shortBody.Load() {
+				body = "short"
+			}
+			_, _ = io.WriteString(w, body)
 			_ = http.NewResponseController(w).Flush()
 		case "/account/info":
 			w.Header().Set("Content-Type", "application/json")
@@ -424,38 +463,65 @@ func TestUCWebsiteTransfer(t *testing.T) {
 	defer grant.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
 	defer cancel()
-	profile := filepath.Join(t.TempDir(), "profile")
-	if err := website.PrivateDirectory(profile, true); err != nil {
-		t.Fatal(err)
+	var config, profileID, profile string
+	if cliapp.ManagedStoreSupported {
+		config, profileID = filepath.Join(isolatedSettingsHome(t), "config.json"), cliapp.NewGrantID()
+		var err error
+		profile, err = websiteProfile(profileID, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		profile = filepath.Join(t.TempDir(), "profile")
+		if err := website.PrivateDirectory(profile, true); err != nil {
+			t.Fatal(err)
+		}
 	}
-	page, err := openWebsitePage(ctx, binary, options, profile, app.URL+"/#/list/all", nil)
+	rewrite := strings.NewReplacer("https://drive.uc.cn", app.URL, "https://pc-api.uc.cn", app.URL)
+	openPage := func(ctx context.Context, profile string) (websitePage, error) {
+		page, err := openWebsitePage(ctx, binary, options, profile, app.URL+"/#/list/all", nil)
+		if err == nil {
+			call := page.Call
+			page.Call = func(ctx context.Context, script string, args json.RawMessage) (json.RawMessage, error) {
+				return call(ctx, rewrite.Replace(script), args)
+			}
+		}
+		return page, err
+	}
+	openDriver := func(ctx context.Context, page websitePage, account, root, rootID string, release func() error) (*uc.Driver, error) {
+		return uc.OpenWebsite(ctx, uc.WebsiteOptions{
+			Tab: page.Tab, Call: page.Call, Release: release, Origin: app.URL,
+			GrantEndpoint: grantURL, Account: account, RootPath: root, RootID: rootID,
+		})
+	}
+	page, err := openPage(ctx, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = page.Release() })
-	rewrite := strings.NewReplacer("https://drive.uc.cn", app.URL, "https://pc-api.uc.cn", app.URL)
-	wrapped := func(ctx context.Context, script string, args json.RawMessage) (json.RawMessage, error) {
-		return page.Call(ctx, rewrite.Replace(script), args)
-	}
-	account, err := uc.WebsiteAccount(ctx, wrapped)
+	account, err := uc.WebsiteAccount(ctx, page.Call)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := uc.OpenWebsite(ctx, uc.WebsiteOptions{
-		Tab: page.Tab, Call: wrapped, Release: page.Release, Origin: app.URL, GrantEndpoint: grantURL, Account: account, RootPath: "/",
-	})
+	d, err := openDriver(ctx, page, account, "/", "", page.Release)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
 	target := core.NativePath("/sample.txt")
-	opened, err := d.Open(ctx, target, core.OpenOptions{})
-	readWebsiteBody(t, opened.Body, err, "sample")
-	if uiPageLoads.Load() != 1 || preflights.Load() != 1 || grantCalls.Load() != 1 {
-		t.Fatalf("grant must use page two and one cross-origin preflight: page=%d preflight=%d grant=%d", uiPageLoads.Load(), preflights.Load(), grantCalls.Load())
+	checkDownload := func() {
+		t.Helper()
+		if uiPageLoads.Load() != 1 || preflights.Load() != 1 || grantCalls.Load() != 1 || bodyCalls.Load() != 1 {
+			t.Fatal("the selected file should use page two and exactly one download")
+		}
+	}
+	if config == "" {
+		opened, err := d.Open(ctx, target, core.OpenOptions{})
+		readWebsiteBody(t, opened.Body, err, "sample")
+		checkDownload()
 	}
 	ranged := core.OpenOptions{Range: &core.Range{Start: 1, End: 4}}
-	opened, err = d.Open(ctx, target, ranged)
+	opened, err := d.Open(ctx, target, ranged)
 	readWebsiteBody(t, opened.Body, err, "ampl")
 	if opened.Range == nil || *opened.Range != (core.ContentRange{Start: 1, End: 4, Total: 6}) ||
 		!keptSession.Load() || !keptReferrer.Load() {
@@ -487,7 +553,7 @@ func TestUCWebsiteTransfer(t *testing.T) {
 		t.Fatal("cancelled read retained the browser body")
 	}
 	stalledBody.Store(false)
-	if _, err := wrapped(ctx, `async () => { window.selected = "different"; return "{}"; }`, json.RawMessage("null")); err != nil {
+	if _, err := page.Call(ctx, `async () => { window.selected = "different"; return "{}"; }`, json.RawMessage("null")); err != nil {
 		t.Fatal(err)
 	}
 	beforeGrant, beforeBody := grantCalls.Load(), bodyCalls.Load()
@@ -497,6 +563,63 @@ func TestUCWebsiteTransfer(t *testing.T) {
 	}
 	if err == nil || grantCalls.Load() != beforeGrant || bodyCalls.Load() != beforeBody {
 		t.Fatal("admitted a download request for another file")
+	}
+	if config == "" {
+		return
+	}
+	rootID := d.RootID()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := websiteSource{ID: cliapp.UcSource, Name: "UC Cloud Drive", Entry: uc.WebsiteURL}
+	source.Open = func(ctx context.Context, _ string, _ []chromedp.ExecAllocatorOption, reopenedProfile string) (websiteSession, error) {
+		if reopenedProfile != profile {
+			return websiteSession{}, errors.New("reopened a different browser profile")
+		}
+		page, err := openPage(ctx, reopenedProfile)
+		if err != nil {
+			return websiteSession{}, err
+		}
+		return websiteSession{Close: page.Release, Mount: func(ctx context.Context, account, root, rootID string, release func() error) (websiteDriver, error) {
+			return openDriver(ctx, page, account, root, rootID, release)
+		}}, nil
+	}
+	host, err := cliapp.NewApp(nil, cliapp.SingleSource(cliapp.UcSource, source.Name, source.route()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := cliapp.LoadConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := cliapp.MountRecord{At: "/uc", Driver: cliapp.UcSource, Options: json.RawMessage(`{"root":"/"}`),
+		Credential: &cliapp.CredentialRef{Kind: cliapp.ManagedCredential, Ref: profileID}}
+	binding, err := json.Marshal(websiteMountGrant{Provider: cliapp.UcSource, Profile: profileID, Account: account, Root: "/", RootID: rootID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, _, err := cliapp.CommitMount(ctx, saved, cliapp.MountRecord{}, mount, nil, binding)
+	if err != nil || receipt.Effect != core.Applied.String() {
+		t.Fatalf("save fixture mount: %v", err)
+	}
+	for _, count := range []*atomic.Int32{&uiPageLoads, &preflights, &grantCalls, &bodyCalls} {
+		count.Store(0)
+	}
+	dest := filepath.Join(filepath.Dir(config), "download")
+	invokeApp(t, host, config, "", false, 0, "get", "/uc/sample.txt", dest)
+	if data, err := os.ReadFile(dest); err != nil || string(data) != "sample" {
+		t.Fatalf("original bytes: %q, %v", data, err)
+	}
+	checkDownload()
+
+	shortBody.Store(true)
+	got := invokeApp(t, host, config, "", false, 1, "get", "/uc/sample.txt", dest+"-short", "--json")
+	if got.Error == nil || got.Error.Code != string(core.InvalidUpstreamResponse) || got.Error.NextAction != "" {
+		t.Fatalf("incomplete website body: %+v", got.Error)
+	}
+	if _, err := os.Stat(dest + "-short"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete website body was published: %v", err)
 	}
 }
 
@@ -638,7 +761,7 @@ func TestQuarkCDPReceipt(t *testing.T) {
 			return download, err
 		})
 	}
-	driver, err := quarkWebsiteSession(nativeCall, transfer, page.Release).Mount(ctx, account, "/", "", page.Release)
+	driver, err := quarkWebsiteSession(nativeCall, transfer).Mount(ctx, account, "/", "", page.Release)
 	if err != nil {
 		t.Fatal(err)
 	}

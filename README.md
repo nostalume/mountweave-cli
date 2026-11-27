@@ -71,6 +71,27 @@ mweave --config demo.json get /files/sample.txt copy.txt
 exists. To connect cloud storage, use `mount add /cloud` and choose a route
 from [Storage sources](docs/sources.md#cloud-authorization).
 
+## Reuse connections
+
+Open a shell to work with files without reconnecting for each command.
+
+```text
+$ mweave --config demo.json shell /files
+mweave:/files> ls
+mweave:/files> stat sample.txt
+mweave:/files> get sample.txt shell-copy.txt
+mweave:/files> exit
+```
+
+Use `cd` to change the mounted directory. Ctrl+C cancels the current command.
+Mounts open on first use and close when you exit. For scripts and pipes, run
+file commands directly. End a destination with `/`, as in
+`mweave mv /files/report.pdf /files/archive/`, to place a file in an existing
+directory and report its actual path. Use `serve` for protocol clients.
+
+Use `trash` to move a file to the source's recycle bin and `remove` to delete
+a file permanently. Each command requires support from the selected source.
+
 ## Share the mount
 
 Save a password in a private file named `webdav-password.txt` beside
@@ -94,6 +115,10 @@ with Ctrl+C.
 The default config is `%LOCALAPPDATA%\mweave\config.json` on Windows and
 `${XDG_CONFIG_HOME:-$HOME/.config}/mweave/config.json` on Linux. `--config`
 selects another JSON file. The configuration stores references to secrets.
+
+After copying a config to another machine, run `mweave mount list` to see
+which mounts need a credential or sign-in. Use `mweave mount edit` to
+recover a managed authorization.
 
 Use `mweave --config demo.json mount add --from mount.json` to load a
 [prepared record](docs/configuration.md#use-a-prepared-record). Add `--json`

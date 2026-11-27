@@ -81,12 +81,14 @@ type Route struct {
 	SignInProblem   *Problem
 	SignIn          error
 	BindingMismatch error
-	prepare         func(json.RawMessage, string, Prompt) (MountSource, json.RawMessage, error)
-	Interactive     bool
-	managed         ManagedAuthorization
-	review          string
-	pool            PoolBuilder
-	Setup           func(context.Context, ConfigSnapshot, MountRecord, string, Prompt, io.Writer) (MountReceipt, string, error)
+	// InspectWebsite checks saved bindings and browser profiles using only local state.
+	InspectWebsite func(id string, options json.RawMessage, read func() ([]byte, error)) error
+	prepare        func(json.RawMessage, string, Prompt) (MountSource, json.RawMessage, error)
+	Interactive    bool
+	managed        ManagedAuthorization
+	review         string
+	pool           PoolBuilder
+	Setup          func(context.Context, ConfigSnapshot, MountRecord, MountRecord, Prompt, io.Writer) (MountReceipt, string, error)
 }
 
 func (r *Route) recoveryProblem(err error) *Problem {
@@ -266,70 +268,79 @@ func unavailableSource() error {
 	return &Problem{Code: string(core.MountUnavailable), Message: "The selected Driver is unavailable in this build.", NextAction: "See mweave mount add --help for the available sources."}
 }
 
+type sourceOpener = func(context.Context, string) (core.Driver, error)
+
 type referencePolicy struct {
-	kind, prompt      string
-	optional, managed bool
+	kind, prompt  string
+	optional      bool
+	open, managed sourceOpener
 }
 
 func (s MountSource) references() referencePolicy {
-	managed := s.OpenManaged != nil
+	p := referencePolicy{open: s.Open, managed: s.OpenManaged}
 	switch {
-	case managed && s.Open == nil:
-		return referencePolicy{ManagedCredential, "Existing authorization record ID", false, true}
+	case p.managed != nil && p.open == nil:
+		p.kind, p.prompt = ManagedCredential, "Existing authorization record ID"
 	case s.Mode == SDKDefaultProfile:
-		return referencePolicy{"profile", "SDK profile (profile:NAME; empty uses SDK defaults)", true, managed}
+		p.kind, p.prompt, p.optional = "profile", "SDK profile (profile:NAME; empty uses SDK defaults)", true
 	case s.Mode != 0:
-		return referencePolicy{"profile", "SDK profile (profile:NAME)", false, managed}
+		p.kind, p.prompt = "profile", "SDK profile (profile:NAME)"
 	case s.Audience.Origin == "":
-		return referencePolicy{optional: true, managed: managed}
+		p.optional = true
 	case s.OptionalCredential:
-		return referencePolicy{"env", s.Secret + " reference (env:NAME or file:PATH; - for anonymous)", true, managed}
+		p.kind, p.prompt, p.optional = "env", s.Secret+" reference (env:NAME or file:PATH; - for anonymous)", true
 	case s.KeyFile != "":
-		return referencePolicy{"env", "Key passphrase reference (env:NAME or file:PATH; empty or - for none)", true, managed}
+		p.kind, p.prompt, p.optional = "env", "Key passphrase reference (env:NAME or file:PATH; empty or - for none)", true
 	default:
-		return referencePolicy{"env", cmp.Or(s.Secret, "Credential") + " reference (env:NAME or file:PATH)", false, managed}
+		p.kind, p.prompt = "env", cmp.Or(s.Secret, "Credential")+" reference (env:NAME or file:PATH)"
 	}
+	return p
 }
 
-func (p referencePolicy) check(ref *CredentialRef) error {
+func (p referencePolicy) opener(ref *CredentialRef) (sourceOpener, error) {
 	switch {
 	case ref == nil && p.optional:
-		return nil
 	case p.kind == ManagedCredential || ref != nil && ref.Kind == ManagedCredential:
-		if p.managed && ref != nil && ref.Kind == ManagedCredential && ValidGrantID(ref.Ref) {
-			return nil
+		if p.managed != nil && ref != nil && ref.Kind == ManagedCredential && ValidGrantID(ref.Ref) {
+			return p.managed, nil
 		}
-		return InvalidConfig("This source requires an existing managed authorization reference.")
+		return nil, InvalidConfig("This source requires an existing managed authorization reference.")
 	case p.kind == "profile":
-		if ref != nil && ref.Kind == "profile" {
-			return nil
+		if ref == nil || ref.Kind != "profile" {
+			return nil, InvalidConfig("Select an SDK profile for this S3 mount.")
 		}
-		return InvalidConfig("Select an SDK profile for this S3 mount.")
 	case p.kind == "":
-		return InvalidConfig("This source does not accept a credential for the selected settings.")
+		return nil, InvalidConfig("This source does not accept a credential for the selected settings.")
 	case ref == nil || ref.Kind != "env" && ref.Kind != "file":
-		return InvalidConfig("This source requires an env or file credential reference.")
+		return nil, InvalidConfig("This source requires an env or file credential reference.")
 	}
-	return nil
+	return p.open, nil
 }
 
-// OpenDriver opens the admitted credential reference.
-func (s MountSource) OpenDriver(ctx context.Context, ref *CredentialRef, base string) (core.Driver, error) {
+func openDriver(ctx context.Context, open sourceOpener, ref *CredentialRef, base string) (core.Driver, error) {
+	var input string
+	if ref != nil {
+		input = ref.Ref
+		if ref.Kind == "env" || ref.Kind == "file" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			var err error
+			input, err = LoadCredential(ref, base)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return constructDriver(ctx, open, input)
+}
+
+func constructDriver(ctx context.Context, open sourceOpener, input string) (core.Driver, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	open := s.Open
-	var input string
-	if ref != nil && ref.Kind == ManagedCredential {
-		open, input = s.OpenManaged, ref.Ref
-	} else if ref != nil && ref.Kind == "profile" {
-		input = ref.Ref
-	} else if ref != nil {
-		var err error
-		input, err = LoadCredential(ref, base)
-		if err != nil {
-			return nil, err
-		}
+	if open == nil {
+		return nil, unavailableSource()
 	}
 	d, err := open(ctx, input)
 	if err == nil {
@@ -371,12 +382,15 @@ func (app *App) sourceNames(query string, include func(SourceConnection) bool) [
 	return names
 }
 
-func (app *App) printSources(w io.Writer, names []string) error {
-	for _, name := range names {
+func (app *App) printSources(w io.Writer, names []string, numbered bool) error {
+	for i, name := range names {
 		source := app.sources[name]
 		label := source.label
 		if !source.guided() {
 			label += " (use --from)"
+		}
+		if numbered {
+			name = fmt.Sprintf("%2d. %s", i+1, name)
 		}
 		if _, err := fmt.Fprintf(w, "  %-16s %s\n", name, label); err != nil {
 			return err

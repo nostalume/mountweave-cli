@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,21 @@ import (
 	"github.com/nostalume/mountweave-cli/internal/cliapp"
 	"github.com/nostalume/mountweave-cli/internal/website"
 )
+
+// Uploaded bytes are transient and live alongside the protected profiles.
+const maxWebsiteStagingBytes = 8 << 30
+
+func websiteUploadDirectory() (string, error) {
+	grants, err := cliapp.GrantDirectory(true)
+	if err != nil {
+		return "", err
+	}
+	directory := filepath.Join(grants, "uploads")
+	if err := website.PrivateDirectory(directory, true); err != nil {
+		return "", cliapp.GrantUnavailable()
+	}
+	return directory, nil
+}
 
 type websiteMountOptions struct {
 	Root string `json:"root"`
@@ -43,16 +59,18 @@ type websiteSession struct {
 }
 
 type websiteSource struct {
-	ID, Connection, Name, Entry string
-	SignIn                      error
-	BindingMismatch             error
-	Open                        func(context.Context, string, []chromedp.ExecAllocatorOption, string) (websiteSession, error)
+	ID, Name, Entry, Access string
+	Instructions            string
+	RestoreSession          bool
+	SignIn                  error
+	BindingMismatch         error
+	Open                    func(context.Context, string, []chromedp.ExecAllocatorOption, string) (websiteSession, error)
 }
 
 func (s websiteSource) route() cliapp.Route {
 	r := cliapp.SourceRoute(nil, s.prepare)
 	r.SignIn, r.SignInProblem, r.BindingMismatch = s.SignIn, websiteSignInProblem(s.Name), s.BindingMismatch
-	return attachWebsiteSetup(r, websiteLogin{Driver: s.ID, Connection: s.Connection, Name: s.Name, Entry: s.Entry}, s.restore, s.verify)
+	return attachWebsiteSetup(r, websiteLogin{Name: s.Name, Entry: s.Entry, Instructions: s.Instructions, Access: s.Access}, s.restore, s.verify)
 }
 
 func (s websiteSource) prepare(options websiteMountOptions, _ string) (cliapp.MountSource, error) {
@@ -168,12 +186,18 @@ func websiteBrowserMissing() error {
 	return &cliapp.Problem{Code: "browser_unavailable", Message: website.BrowserUnavailable, NextAction: "Use another connection method offered for this source."}
 }
 
-func openWebsitePage(ctx context.Context, binary string, options []chromedp.ExecAllocatorOption, profile, page string, blockedPaths []string) (websitePage, error) {
+func openWebsitePage(ctx context.Context, binary string, options []chromedp.ExecAllocatorOption, profile, page string, blockedPaths []string, checks ...func(context.Context) error) (websitePage, error) {
+	return openWebsitePageUsing(ctx, website.Launch, binary, options, profile, page, blockedPaths, checks...)
+}
+
+type websiteLauncher func(context.Context, string, []chromedp.ExecAllocatorOption, string, ...chromedp.ContextOption) (context.Context, func() error, error)
+
+func openWebsitePageUsing(ctx context.Context, launch websiteLauncher, binary string, options []chromedp.ExecAllocatorOption, profile, page string, blockedPaths []string, checks ...func(context.Context) error) (websitePage, error) {
 	origin, err := url.Parse(page)
 	if err != nil || origin.Scheme != "https" || origin.Host == "" {
 		return websitePage{}, core.Fail(core.InvalidRequest, nil)
 	}
-	browser, release, err := website.Launch(ctx, binary, options, profile)
+	browser, release, err := launch(ctx, binary, options, profile)
 	if err != nil {
 		switch err {
 		case website.ErrBrowserMissing:
@@ -192,6 +216,13 @@ func openWebsitePage(ctx context.Context, binary string, options []chromedp.Exec
 	}
 	navigation, stopNavigation := context.WithTimeout(browser, 15*time.Second)
 	stopOnCancel := context.AfterFunc(ctx, stopNavigation)
+	for _, check := range checks {
+		if err := check(navigation); err != nil {
+			stopOnCancel()
+			stopNavigation()
+			return websitePage{}, errors.Join(core.Fail(core.UnsupportedOperation, err), closeBrowser())
+		}
+	}
 	patterns := make([]*network.BlockPattern, 0, len(blockedPaths))
 	for _, path := range blockedPaths {
 		patterns = append(patterns, &network.BlockPattern{URLPattern: "https://*:*" + path, Block: true})
@@ -251,16 +282,22 @@ type websitePage struct {
 	Tab     context.Context
 }
 
-func (s websiteSource) pageRoute(entry string, visible bool, bind func(websitePage) websiteSession) cliapp.Route {
+func (s websiteSource) withPage(entry string, visible bool, bind func(websitePage) websiteSession) websiteSource {
+	launch := website.Launch
+	if s.RestoreSession {
+		launch = website.LaunchWithSessionCookies
+	}
 	s.Open = func(ctx context.Context, binary string, options []chromedp.ExecAllocatorOption, profile string) (websiteSession, error) {
 		if visible {
 			options = append(options, chromedp.VisibleWindow)
 		}
-		page, err := openWebsitePage(ctx, binary, options, profile, entry, nil)
+		page, err := openWebsitePageUsing(ctx, launch, binary, options, profile, entry, nil)
 		if err != nil {
 			return websiteSession{}, err
 		}
-		return bind(page), nil
+		session := bind(page)
+		session.Close = page.Release
+		return session, nil
 	}
-	return s.route()
+	return s
 }

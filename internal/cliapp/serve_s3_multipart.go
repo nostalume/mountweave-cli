@@ -35,9 +35,9 @@ func (o s3MultipartOptions) limits() input.Options {
 	return input.Options{MaxBytes: o.MaxStagingBytes, MaxInputs: maxInputs, MaxAppendBytes: block, MaxBlocks: int(blocks)}
 }
 
-func s3MultipartIdentity(saved ConfigSnapshot, e Export) (core.Principal, error) {
+func s3MultipartIdentity(saved ConfigSnapshot, root, bucket, accessKey string) (core.Principal, error) {
 	for _, m := range saved.Value.Mounts {
-		if m.At != e.Root {
+		if m.At != root {
 			continue
 		}
 		// Preserve JSON numbers and ignore presentation of the saved options.
@@ -51,7 +51,7 @@ func s3MultipartIdentity(saved ConfigSnapshot, e Export) (core.Principal, error)
 			Bucket, AccessKey, ConfigDir, Root, Driver string
 			Options                                    any
 			Credential                                 *CredentialRef
-		}{e.S3.Bucket, e.Auth.AccessKeyID, filepath.Dir(saved.Path), m.At, m.Driver, options, m.Credential})
+		}{bucket, accessKey, filepath.Dir(saved.Path), m.At, m.Driver, options, m.Credential})
 		if err != nil {
 			return "", err
 		}

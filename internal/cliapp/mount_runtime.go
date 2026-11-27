@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,16 +23,17 @@ func withMountBindings(ctx context.Context) context.Context {
 	return context.WithValue(ctx, MountBindingsKey{}, make(map[any]any))
 }
 
-func (app *App) install(ctx context.Context, c *core.Core, saved ConfigSnapshot, m MountRecord) error {
+func (app *App) install(ctx context.Context, c *core.Core, saved ConfigSnapshot, m MountRecord, sources iter.Seq[MountRecord]) error {
 	base := filepath.Dir(saved.Path)
 	src, err := PrepareMountSource(app, m, base)
 	if err != nil {
 		return err
 	}
-	if err := CheckAudience(app, m, src, saved, SourceRecords(saved.Value.Mounts...)); err != nil {
+	open, err := admitMount(app, m, src, saved, sources)
+	if err != nil {
 		return err
 	}
-	d, err := app.openMountDriver(ctx, src, saved, m, MountRecord{}, false)
+	d, err := app.openMountDriver(ctx, src, open, saved, m, sources, false)
 	if err != nil {
 		return err
 	}
@@ -42,32 +44,98 @@ func (app *App) install(ctx context.Context, c *core.Core, saved ConfigSnapshot,
 }
 
 func OpenFor(app *App, ctx context.Context, saved ConfigSnapshot, targets ...core.Address) (*core.Core, error) {
-	for _, target := range targets {
-		if err := target.Validate(); err != nil {
-			return nil, err
-		}
-	}
+	return app.openFor(ctx, saved, false, targets...)
+}
+
+// A directory listing above a mount only needs its name in the Core namespace.
+type mountPointDriver struct{}
+
+func (mountPointDriver) Stat(context.Context, core.NativeAddress, ...core.ReadSelection) (core.Metadata, error) {
+	return core.Metadata{}, core.Fail(core.UnsupportedOperation, nil)
+}
+
+func (mountPointDriver) Enumerate(context.Context, core.NativeQuery) (core.Iterator, error) {
+	return nil, core.Fail(core.UnsupportedOperation, nil)
+}
+
+func (mountPointDriver) Open(context.Context, core.NativeAddress, core.OpenOptions) (core.Opened, error) {
+	return core.Opened{}, core.Fail(core.UnsupportedOperation, nil)
+}
+
+func (mountPointDriver) Close() error { return nil }
+
+type fileRuntime struct {
+	core                *core.Core
+	bindings            map[any]any
+	mounts              map[string]*core.Mount // nil denotes a connected mount, a handle denotes a placeholder.
+	checkedPrivatePaths bool
+}
+
+func newFileRuntime() (*fileRuntime, error) {
 	c, err := core.New(core.Options{Authorize: func(context.Context, core.Principal, core.Action, core.Address) error { return nil }})
 	if err != nil {
 		return nil, err
 	}
-	ctx = withMountBindings(ctx)
-	checkedPrivatePaths := false
+	return &fileRuntime{core: c, bindings: make(map[any]any), mounts: make(map[string]*core.Mount)}, nil
+}
+
+func (app *App) openFor(ctx context.Context, saved ConfigSnapshot, virtual bool, targets ...core.Address) (*core.Core, error) {
+	rt, err := newFileRuntime()
+	if err != nil {
+		return nil, err
+	}
+	if err := app.installFor(ctx, saved, rt, virtual, targets...); err != nil {
+		return nil, errors.Join(err, CloseRuntime(rt.core))
+	}
+	return rt.core, nil
+}
+
+func (app *App) installFor(ctx context.Context, saved ConfigSnapshot, rt *fileRuntime, virtual bool, targets ...core.Address) error {
+	for _, target := range targets {
+		if err := target.Validate(); err != nil {
+			return err
+		}
+	}
+	var parent string
+	if virtual && len(targets) == 1 && targets[0].Namespace() == core.TreeNamespace {
+		parent = targets[0].Value()
+	}
+	ctx = context.WithValue(ctx, MountBindingsKey{}, rt.bindings)
+	sources := CredentialRecords(saved.Value.Mounts)
 	for _, m := range saved.Value.Mounts {
 		if !slices.ContainsFunc(targets, func(target core.Address) bool { return mountIntersects(m.At, target) }) {
 			continue
 		}
-		if !checkedPrivatePaths && (m.Driver == "local" || m.Driver == PoolSourceID) {
-			if err := CheckStorageLocations(saved, true); err != nil {
-				return nil, errors.Join(err, CloseRuntime(c))
+		placeholder := parent != "" && parent != m.At && core.Within(m.At, parent)
+		prior, installed := rt.mounts[m.At]
+		if installed && (prior == nil || placeholder) {
+			continue
+		}
+		if placeholder {
+			point, err := rt.core.Install(m.At, mountPointDriver{})
+			if err != nil {
+				return err
 			}
-			checkedPrivatePaths = true
+			rt.mounts[m.At] = point
+			continue
 		}
-		if err := app.install(ctx, c, saved, m); err != nil {
-			return nil, errors.Join(app.mountFailure(err, saved, m), CloseRuntime(c))
+		if !rt.checkedPrivatePaths && (m.Driver == "local" || m.Driver == PoolSourceID) {
+			if err := CheckStorageLocations(saved, true); err != nil {
+				return err
+			}
+			rt.checkedPrivatePaths = true
 		}
+		if prior != nil {
+			if err := prior.Retire(ctx); err != nil {
+				return err
+			}
+		}
+		if err := app.install(ctx, rt.core, saved, m, sources); err != nil {
+			return app.mountFailure(err, saved, m)
+		}
+		rt.mounts[m.At] = nil
 	}
-	return c, nil
+	return nil
 }
 
 func mountIntersects(mount string, address core.Address) bool {
@@ -119,16 +187,11 @@ func CloseRuntime(c *core.Core) error {
 	return c.Close(ctx)
 }
 
-func (app *App) openMountDriver(ctx context.Context, src MountSource, saved ConfigSnapshot, m, prior MountRecord, initialize bool) (core.Driver, error) {
+func (app *App) openMountDriver(ctx context.Context, src MountSource, open sourceOpener, saved ConfigSnapshot, m MountRecord, sources iter.Seq[MountRecord], initialize bool) (core.Driver, error) {
 	if src.pool != nil {
-		return app.openPool(ctx, src, saved, m, prior, initialize)
+		return app.openPool(ctx, src, saved, m, sources, initialize)
 	}
-	return src.OpenDriver(ctx, m.Credential, filepath.Dir(saved.Path))
-}
-
-func (app *App) probeMount(ctx context.Context, src MountSource, saved ConfigSnapshot, m, prior MountRecord) error {
-	d, err := app.openMountDriver(ctx, src, saved, m, prior, prior.At == "")
-	return src.Route.ProjectError(src.verifyAndClose(ctx, d, err))
+	return openDriver(ctx, open, m.Credential, filepath.Dir(saved.Path))
 }
 
 func (src MountSource) verifyAndClose(ctx context.Context, d core.Driver, err error) error {
@@ -144,12 +207,17 @@ func (src MountSource) verifyAndClose(ctx context.Context, d core.Driver, err er
 func VerifyNativeRoot(root core.NativeQuery) func(context.Context, core.Driver) error {
 	return func(ctx context.Context, d core.Driver) error {
 		it, err := d.Enumerate(ctx, root)
-		if err != nil {
+		if it == nil {
+			if err == nil {
+				return core.Fail(core.InvalidUpstreamResponse, nil)
+			}
 			return err
 		}
-		_, err = it.Next(ctx, 1)
-		if err == io.EOF {
-			err = nil
+		if err == nil {
+			_, err = it.Next(ctx, 1)
+			if err == io.EOF {
+				err = nil
+			}
 		}
 		return errors.Join(err, it.Close())
 	}

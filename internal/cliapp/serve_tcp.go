@@ -86,13 +86,13 @@ func (s *tcpExport) Close() error {
 	return err
 }
 
-func prepareFTPExport(ctx context.Context, c *core.Core, e Export, p core.Principal, secret string, tlsConfig *tls.Config) (*tcpExport, error) {
+func prepareFTPExport(ctx context.Context, c *core.Core, root core.Address, p core.Principal, username, secret string, ports *portRange, tlsConfig *tls.Config) (*tcpExport, error) {
 	if strings.ContainsFunc(secret, func(r rune) bool { return r < 32 || r == 127 }) {
 		return nil, InvalidConfig("The FTP password cannot contain ASCII control characters.")
 	}
-	matches := passwordMatches(e.Auth.Username, secret)
+	matches := passwordMatches(username, secret)
 	options := ftp.Options{
-		Root: core.Path(e.Root), CursorTTL: time.Minute, DataConnectTimeout: 10 * time.Second,
+		Root: root, CursorTTL: time.Minute, DataConnectTimeout: 10 * time.Second,
 		Limits: ftp.Limits{CommandBytes: 4096, TransferBufferBytes: 32 << 10, PageNameBytes: 1 << 20},
 		Authenticate: func(_ context.Context, login ftp.Login) (core.Principal, error) {
 			if matches(login.Username, login.Password) {
@@ -100,7 +100,7 @@ func prepareFTPExport(ctx context.Context, c *core.Core, e Export, p core.Princi
 			}
 			return "", core.Fail(core.Unauthenticated, nil)
 		},
-		ListenPassive: e.listenPassive,
+		ListenPassive: ports.listen,
 		TLSConfig:     tlsConfig,
 	}
 	files, err := ftp.New(c, options)
@@ -116,14 +116,14 @@ func prepareFTPExport(ctx context.Context, c *core.Core, e Export, p core.Princi
 	return newTCPExport(func(conn net.Conn) { _ = files.ServeConn(ctx, conn) }), nil
 }
 
-func (e Export) listenPassive(ctx context.Context, local, remote net.Addr) (net.Listener, netip.AddrPort, error) {
+func (ports *portRange) listen(ctx context.Context, local, remote net.Addr) (net.Listener, netip.AddrPort, error) {
 	ip := local.(*net.TCPAddr).AddrPort().Addr().Unmap()
 	peer := remote.(*net.TCPAddr).AddrPort().Addr().Unmap()
 	network := net.ListenConfig{}
 	host := ip.String()
 	first, last := 0, 0
-	if e.PassivePorts != nil {
-		first, last = int(e.PassivePorts.First), int(e.PassivePorts.Last)
+	if ports != nil {
+		first, last = int(ports.First), int(ports.Last)
 	}
 	for port := first; port <= last; port++ {
 		listener, err := network.Listen(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
@@ -163,8 +163,7 @@ type sftpExport struct {
 	principal core.Principal
 }
 
-func prepareSFTPExport(ctx context.Context, c *core.Core, e Export, p core.Principal, base string) (*tcpExport, error) {
-	hostPath, clientPath := e.sshKeyPaths(base)
+func prepareSFTPExport(ctx context.Context, c *core.Core, scope exportScope, p core.Principal, username, hostPath, clientPath string) (*tcpExport, error) {
 	hostKey, err := ReadCredentialFile(hostPath)
 	if err != nil {
 		return nil, InvalidConfig("The SFTP host key file could not be read.")
@@ -188,18 +187,18 @@ func prepareSFTPExport(ctx context.Context, c *core.Core, e Export, p core.Princ
 	}
 	trusted := key.Marshal()
 	config := &ssh.ServerConfig{PublicKeyCallback: func(conn ssh.ConnMetadata, candidate ssh.PublicKey) (*ssh.Permissions, error) {
-		if conn.User() == e.Auth.Username && bytes.Equal(trusted, candidate.Marshal()) {
+		if conn.User() == username && bytes.Equal(trusted, candidate.Marshal()) {
 			return nil, nil
 		}
 		return nil, core.Fail(core.Unauthenticated, nil)
 	}}
 	config.AddHostKey(host)
 	mode := sftp.ReadOnlyView
-	if e.Access == "read_write" {
+	if scope.writable {
 		mode = sftp.ReadWriteView
 	}
 	files, err := sftp.New(c, sftp.Options{
-		Root: core.Path(e.Root), ModeView: mode, CursorTTL: time.Minute,
+		Root: core.Path(scope.root), ModeView: mode, CursorTTL: time.Minute,
 		Limits: sftp.Limits{Handles: 16, PageNameBytes: 1 << 20},
 	})
 	if err != nil {

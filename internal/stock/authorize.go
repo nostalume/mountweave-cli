@@ -56,7 +56,7 @@ func aliPanScopes(raw []byte) ([]string, error) {
 }
 
 func chooseAliPanScopes(ask cliapp.Prompt) ([]string, error) {
-	mode, err := cliapp.AskChoice(ask, "Requested Aliyun Drive access (read or read_write)", "read", "read", "read_write")
+	mode, err := cliapp.AskMenu(ask, "Requested Aliyun Drive access", "read", "read", "read_write")
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +305,7 @@ const dropboxRedirect = "http://localhost:53682/callback"
 
 var dropboxAuthorization = cliapp.NewBrowserAuthorization(cliapp.BrowserAuthorization{
 	ManagedAuthorization: cliapp.ManagedAuthorization{
-		Provider: "dropbox", Label: "Dropbox", Method: "browser",
+		Provider: "dropbox", Label: "Dropbox", Method: "browser", ConfigureBeforeGrant: true,
 		Scopes: dropboxMountScopes, Client: dropboxOAuthClient,
 	},
 	AuthorizeURL: "https://www.dropbox.com/oauth2/authorize", TokenURL: "https://" + dropbox.ControlHost + "/oauth2/token",
@@ -327,15 +327,13 @@ func dropboxIdentity(ctx context.Context, reply cliapp.OAuthTokenReply) (string,
 	return reply.Account, email, err
 }
 
-const googleDriveReadScope = "https://www.googleapis.com/auth/drive.readonly"
-
 var googleDriveAuthorization = cliapp.NewBrowserAuthorization(cliapp.BrowserAuthorization{
 	ManagedAuthorization: cliapp.ManagedAuthorization{
 		Provider: "googledrive", Label: "Google Drive", Method: "browser",
-		Scopes: func([]byte) ([]string, error) { return []string{googleDriveReadScope}, nil },
+		Scopes: func([]byte) ([]string, error) { return []string{googledrive.ReadOnlyScope}, nil },
 		Client: googleDriveOAuthClient,
 	},
-	AuthorizeURL: "https://accounts.google.com/o/oauth2/v2/auth", TokenURL: "https://oauth2.googleapis.com/token",
+	AuthorizeURL: googledrive.AuthorizeURL, TokenURL: googledrive.TokenURL,
 	ListenAddress: "127.0.0.1:0",
 	OfflineParam:  "access_type",
 	FirstPrompt:   "consent select_account", SwitchPrompt: "consent select_account", ReauthorizePrompt: "consent",
@@ -360,13 +358,11 @@ func googleDriveOAuthClient(ask cliapp.Prompt, previous cliapp.OAuthClient) (cli
 			NextAction: "Provide the Desktop app client JSON downloaded from Google Cloud, or use an existing access token."}
 	}
 	defer clear(data)
-	var client struct {
-		Installed *cliapp.OAuthClient `json:"installed"`
-	}
-	if err := json.Unmarshal(data, &client); err != nil || client.Installed == nil || strings.TrimSpace(client.Installed.ClientID) == "" {
+	id, secret, err := googledrive.ParseDesktopOAuthClient(data)
+	if err != nil {
 		return cliapp.OAuthClient{}, cliapp.InvalidConfig("Provide a Google Desktop app client JSON file.")
 	}
-	return *client.Installed, nil
+	return cliapp.OAuthClient{ClientID: id, ClientSecret: secret}, nil
 }
 
 func googleDriveIdentity(ctx context.Context, reply cliapp.OAuthTokenReply) (string, string, error) {
@@ -495,7 +491,7 @@ func pickAliPanDrive(drives alipan.DriveInfo, ask cliapp.Prompt) (string, error)
 	if len(labels) == 1 {
 		return ids[0], nil
 	}
-	name, err := cliapp.AskChoice(ask, "Drive ("+strings.Join(labels, ", ")+")", labels[0], labels...)
+	name, err := cliapp.AskMenu(ask, "Drive", labels[0], labels...)
 	if err != nil {
 		return "", err
 	}

@@ -100,16 +100,15 @@ func checkHostPaths(saved ConfigSnapshot, checkPool, websiteSetup bool) error {
 			}
 			actual = resolved
 		}
-		if grantPath != "" && hostPathsOverlap(grantPath, actual) {
-			if protectGrants || checkExports && source.member == "" && slices.ContainsFunc(saved.Value.Exports, func(e Export) bool {
-				if !e.containsMount(source.record.At) {
+		if grantPath != "" && hostPathsOverlap(grantPath, actual) &&
+			(protectGrants || checkExports && source.member == "" && slices.ContainsFunc(saved.Value.Exports, func(e Export) bool {
+				if !e.scope().containsMount(source.record.At) {
 					return false
 				}
 				subtree := strings.TrimPrefix(strings.TrimPrefix(e.Root, source.record.At), "/")
 				return hostPathsOverlap(grantPath, filepath.Join(actual, filepath.FromSlash(subtree)))
-			}) {
-				return InvalidConfig("A Local mount overlaps protected authorization data.")
-			}
+			})) {
+			return InvalidConfig("A Local mount overlaps protected authorization data.")
 		}
 		if !source.offline {
 			root = actual

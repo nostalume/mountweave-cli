@@ -170,7 +170,7 @@ func guideFTP(o *ftpOptions, ask cliapp.Prompt) error {
 		return err
 	}
 	var err error
-	o.Security, err = cliapp.AskChoice(ask, "Transport (explicit_tls, implicit_tls or plain)", cmp.Or(o.Security, "explicit_tls"), "explicit_tls", "implicit_tls", "plain")
+	o.Security, err = cliapp.AskMenu(ask, "Transport", cmp.Or(o.Security, "explicit_tls"), "explicit_tls", "implicit_tls", "plain")
 	if err != nil {
 		return err
 	}

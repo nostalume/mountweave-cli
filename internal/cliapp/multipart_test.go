@@ -102,6 +102,11 @@ func TestS3MultipartRestart(t *testing.T) {
 		"s3":{"bucket":"visible","multipart":{"state_directory":"state","max_staging_bytes":33554432}},"auth":{"access_key_id":"client-key","credential":{"kind":"env","ref":"MWEAVE_TEST_INBOUND_KEY"}}},
 		{"protocol":"s3","listen":%q,"root":"/objects","s3":{"bucket":"visible","max_put_bytes":32},"auth":{"access_key_id":"client-key","credential":{"kind":"env","ref":"MWEAVE_TEST_INBOUND_KEY"}}}]}`,
 		upstream.URL, addresses[0], addresses[1])))
+	var details, diagnostics bytes.Buffer
+	if code := objectHost(t).Run(ctx, []string{"--config", cfg, "stat", "key:objects/:" + sealedObject},
+		nil, &details, &diagnostics, false); code != 0 || !strings.Contains(details.String(), "key:/objects:"+sealedObject+"\n") {
+		t.Fatalf("qualified object path: %d %q %s", code, &details, &diagnostics)
+	}
 	start := func() func() {
 		t.Helper()
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMultipartServerProcess$")

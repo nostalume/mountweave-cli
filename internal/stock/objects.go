@@ -188,7 +188,7 @@ func guideS3(o *s3Options, ask cliapp.Prompt) error {
 	var err error
 	if o.Bucket == "" {
 		choices := slices.Sorted(maps.Keys(s3Presets))
-		service, err = cliapp.AskChoice(ask, "S3 service ("+strings.Join(choices, ", ")+")", "aws", choices...)
+		service, err = cliapp.AskMenu(ask, "S3 service", "aws", choices...)
 		if err != nil {
 			return err
 		}

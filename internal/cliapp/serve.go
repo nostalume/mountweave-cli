@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,9 +43,17 @@ func (s TLSExport) Serve(l net.Listener) error { return s.ServeTLS(l, "", "") }
 
 type endpoint struct {
 	info     EndpointInfo
+	loopback bool
+	scheme   string
 	Server   exportServer
 	Listener net.Listener
 	close    func(context.Context) error
+}
+
+type exportBinding struct {
+	protocol  exportProtocol
+	principal core.Principal
+	scope     exportScope
 }
 
 type ExportRuntime struct {
@@ -62,7 +71,7 @@ func (app *App) runServe(ctx context.Context, saved ConfigSnapshot, machine bool
 
 	var code int
 	var failure error
-	started := false
+	var started bool
 	if err == nil {
 		code = runtime.ready(ctx, machine, out, diagnostics)
 		started = code == 0
@@ -92,6 +101,7 @@ func PrepareExports(app *App, ctx context.Context, saved ConfigSnapshot, diagnos
 		diagnostics = io.Discard
 	}
 	logger := log.New(diagnostics, "", 0)
+	base := filepath.Dir(saved.Path)
 	if len(saved.Value.Exports) == 0 {
 		return runtime, InvalidConfig("No protocol exports are configured. Use mweave export add.")
 	}
@@ -113,46 +123,32 @@ func PrepareExports(app *App, ctx context.Context, saved ConfigSnapshot, diagnos
 	// the grace period ends or their client cancels.
 	requests, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	runtime.cancel = cancel
-	principals := make([]core.Principal, len(saved.Value.Exports))
+	sources := CredentialRecords(saved.Value.Mounts)
+	bindings := make([]exportBinding, len(saved.Value.Exports))
 	for i, e := range saved.Value.Exports {
-		if err := e.checkCredential(saved); err != nil {
+		protocol := exportProtocol(e.Protocol)
+		p, scope := core.Principal(e.Listen), protocol.scope(e)
+		err := e.checkCredential(base, sources)
+		if err == nil && scope.keys && e.S3 != nil && e.S3.Multipart != nil {
+			p, err = s3MultipartIdentity(saved, scope.root, e.S3.Bucket, e.Auth.AccessKeyID)
+		}
+		if err != nil {
 			return runtime, app.serveProblem(err, "Export at %q", e.Listen)
 		}
-		p := core.Principal(e.Listen)
-		if e.S3 != nil && e.S3.Multipart != nil {
-			p, err = s3MultipartIdentity(saved, e)
-			if err != nil {
-				return runtime, app.serveProblem(err, "Export at %q", e.Listen)
-			}
-		}
-		principals[i], scopes[p] = p, e.scope()
+		bindings[i], scopes[p] = exportBinding{protocol, p, scope}, scope
 	}
 
 	ctx = withMountBindings(ctx)
 	for _, m := range saved.Value.Mounts {
-		if slices.ContainsFunc(saved.Value.Exports, func(e Export) bool { return e.containsMount(m.At) }) {
-			if err := app.install(ctx, runtime.Core, saved, m); err != nil {
+		if slices.ContainsFunc(bindings, func(b exportBinding) bool { return b.scope.containsMount(m.At) }) {
+			if err := app.install(ctx, runtime.Core, saved, m, sources); err != nil {
 				return runtime, app.mountFailure(err, saved, m)
 			}
 		}
 	}
 	for i, e := range saved.Value.Exports {
-		if e.Protocol == "s3" {
-			// Resolve the native key binding without opening a cursor or reading storage.
-			if _, err := runtime.Core.Capture(ctx, core.AddressAccess{Address: core.Prefix(e.Root, "")}); err != nil {
-				if core.CodeOf(err) == core.UnsupportedOperation {
-					err = InvalidConfig("S3 requires a mount with native object keys.")
-				}
-				return runtime, app.serveProblem(err, "Export root %q at %q", e.Root, e.Listen)
-			}
-			continue
-		}
-		entry, err := runtime.Core.Stat(ctx, principals[i], core.Path(e.Root))
-		if err == nil && (entry.Kind != core.Directory || entry.Virtual) {
-			err = core.Fail(core.NotDirectory, nil)
-		}
-		if err != nil {
-			err = app.fileError(saved, []core.Address{core.Path(e.Root)}, err, "", "")
+		b := bindings[i]
+		if err := app.checkExportRoot(ctx, runtime.Core, saved, b.principal, b.scope); err != nil {
 			return runtime, app.serveProblem(err, "Export root %q at %q", e.Root, e.Listen)
 		}
 	}
@@ -161,7 +157,7 @@ func PrepareExports(app *App, ctx context.Context, saved ConfigSnapshot, diagnos
 		if err := ctx.Err(); err != nil {
 			return runtime, err
 		}
-		item, err := prepareEndpoint(ctx, requests, saved, runtime.Core, e, principals[i], logger)
+		item, err := prepareEndpoint(ctx, requests, base, runtime.Core, e, bindings[i], logger)
 		if err != nil {
 			return runtime, app.serveProblem(err, "Export at %q", e.Listen)
 		}
@@ -172,7 +168,7 @@ func PrepareExports(app *App, ctx context.Context, saved ConfigSnapshot, diagnos
 			return runtime, err
 		}
 		var network net.ListenConfig
-		if !item.info.TLS && item.info.Protocol != "sftp" {
+		if item.loopback {
 			network.Control = requireLoopback
 		}
 		l, err := network.Listen(ctx, "tcp", item.info.Listen)
@@ -192,6 +188,26 @@ func PrepareExports(app *App, ctx context.Context, saved ConfigSnapshot, diagnos
 	return runtime, nil
 }
 
+func (app *App) checkExportRoot(ctx context.Context, c *core.Core, saved ConfigSnapshot, p core.Principal, scope exportScope) error {
+	if scope.keys {
+		// Resolve the native key binding without opening a cursor or reading storage.
+		_, err := c.Capture(ctx, core.AddressAccess{Address: core.Prefix(scope.root, "")})
+		if core.CodeOf(err) == core.UnsupportedOperation {
+			return InvalidConfig("S3 requires a mount with native object keys.")
+		}
+		return err
+	}
+	address := core.Path(scope.root)
+	entry, err := c.Stat(ctx, p, address)
+	if err == nil && (entry.Kind != core.Directory || entry.Virtual) {
+		err = core.Fail(core.NotDirectory, nil)
+	}
+	if err != nil {
+		return app.fileError(saved, []core.Address{address}, err, "", "")
+	}
+	return nil
+}
+
 // ListenConfig supplies the resolved address before the socket is bound.
 func requireLoopback(_ string, address string, _ syscall.RawConn) error {
 	host, _, _ := net.SplitHostPort(address)
@@ -202,15 +218,18 @@ func requireLoopback(_ string, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-func prepareEndpoint(startup, ctx context.Context, saved ConfigSnapshot, c *core.Core, e Export, p core.Principal, logger *log.Logger) (*endpoint, error) {
-	base := filepath.Dir(saved.Path)
-	item := &endpoint{info: EndpointInfo{e.Protocol, e.Listen, e.Root, cmp.Or(e.Access, "read"), e.TLS != nil}}
-	if e.Protocol == "sftp" {
-		return item.withTCP(prepareSFTPExport(ctx, c, e, p, base))
-	}
-	secret, err := LoadCredential(e.Auth.Credential, base)
-	if err != nil {
-		return nil, err
+func prepareEndpoint(startup, ctx context.Context, base string, c *core.Core, e Export, b exportBinding, logger *log.Logger) (*endpoint, error) {
+	p, scope, protocol := b.principal, b.scope, b.protocol
+	item := &endpoint{info: EndpointInfo{e.Protocol, e.Listen, scope.root, cmp.Or(e.Access, "read"), e.TLS != nil}, scheme: "http", loopback: e.TLS == nil}
+	var secret string
+	var err error
+	if ref := e.Auth.Credential; ref != nil {
+		secret, err = LoadCredential(ref, base)
+		if err != nil {
+			return nil, err
+		}
+	} else if protocol != "sftp" {
+		return nil, InvalidConfig("An export needs an env or file credential reference.")
 	}
 	var tlsConfig *tls.Config
 	if e.TLS != nil {
@@ -219,16 +238,29 @@ func prepareEndpoint(startup, ctx context.Context, saved ConfigSnapshot, c *core
 			return nil, &Problem{Code: "invalid_config", Message: "The TLS certificate and key could not be loaded.", NextAction: "Check the certificate and key files."}
 		}
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
-	}
-	if e.Protocol == "ftp" {
-		return item.withTCP(prepareFTPExport(ctx, c, e, p, secret, tlsConfig))
+		item.scheme = "https"
 	}
 	var handler http.Handler
-	if e.Protocol == "s3" {
+	switch protocol {
+	case "sftp":
+		item.scheme, item.loopback = "sftp", false
+		return item.withTCP(prepareSFTPExport(ctx, c, scope, p, e.Auth.Username,
+			OptionalHostPath(base, e.HostKeyFile), OptionalHostPath(base, e.Auth.PublicKeyFile)))
+	case "ftp":
+		item.scheme = "ftp"
+		return item.withTCP(prepareFTPExport(ctx, c, core.Path(scope.root), p, e.Auth.Username, secret, e.PassivePorts, tlsConfig))
+	case "s3":
+		if e.S3 == nil {
+			return nil, InvalidConfig("S3 needs export options.")
+		}
 		// Pass the exact signed request target to S3 without ServeMux path cleaning.
-		handler, item.close, err = s3ExportHandler(startup, ctx, saved, c, e, p, secret, logger)
-	} else {
-		handler, item.close, err = directoryHTTPHandler(c, e, p, secret)
+		handler, item.close, err = s3ExportHandler(startup, ctx, base, c, *e.S3, scope, p, e.Auth.AccessKeyID, secret, logger)
+	case "webdav":
+		handler, err = webDAVExportHandler(c, core.Path(scope.root), p, e.Auth.Username, secret, e.CreateOnly)
+	case "http":
+		handler, item.close, err = jsonExportHandler(c, p, secret)
+	default:
+		return nil, InvalidConfig("An export needs a supported protocol, listener and access policy.")
 	}
 	if err != nil {
 		return nil, err
@@ -258,35 +290,22 @@ func (e *endpoint) withTCP(server exportServer, err error) (*endpoint, error) {
 }
 
 func (r *ExportRuntime) ready(ctx context.Context, machine bool, out, diagnostics io.Writer) int {
-	if file, ok := out.(*os.File); ok {
-		pipe, release, err := pollablePipe(file)
-		if err != nil {
-			outputFailure(diagnostics)
-			return 1
-		}
-		if release != nil {
-			defer release()
-		}
-		defer closeOnCancel(ctx, pipe)()
-		out = pipe
+	out, finish, err := prepareStream(ctx, out, true)
+	if err != nil {
+		outputFailure(diagnostics)
+		return 1
 	}
+	defer finish(nil)
 	info := make([]EndpointInfo, 0, len(r.Endpoints))
 	var text strings.Builder
 	for _, item := range r.Endpoints {
 		info = append(info, item.info)
 		if !machine {
-			scheme := "http"
-			switch {
-			case item.info.Protocol == "sftp" || item.info.Protocol == "ftp":
-				scheme = item.info.Protocol
-			case item.info.TLS:
-				scheme = "https"
-			}
 			protocol := item.info.Protocol
 			if protocol == "ftp" && item.info.TLS {
 				protocol = "ftp (explicit TLS)"
 			}
-			fmt.Fprintf(&text, "Serving %s at %s://%s for %q (%s).\n", protocol, scheme, item.info.Listen, item.info.Root, item.info.Access)
+			fmt.Fprintf(&text, "Serving %s at %s://%s for %q (%s).\n", protocol, item.scheme, item.info.Listen, item.info.Root, item.info.Access)
 		}
 	}
 	return r.app.respond(machine, out, diagnostics, struct {
@@ -351,19 +370,27 @@ func (r *ExportRuntime) Shutdown(started bool, timeout time.Duration) error {
 			}
 		}
 	}
+	// Begin every release under the same deadline. A blocked adapter must
+	// not delay release of unrelated protocol state or mount retirement.
+	var finished sync.WaitGroup
+	var coreErr error
 	if r.Core != nil {
-		closed := make(chan error, 1)
-		go func() { closed <- r.Core.Close(ctx) }()
-		for _, item := range r.Endpoints {
-			if item.close != nil {
-				if err := item.close(ctx); err != nil {
-					result = errors.Join(result, r.app.serveProblem(err, "Adapter at %q", item.info.Listen))
-				}
-			}
+		finished.Go(func() { coreErr = r.Core.Close(ctx) })
+	}
+	adapterErrors := make([]error, len(r.Endpoints))
+	for i, item := range r.Endpoints {
+		if item.close != nil {
+			finished.Go(func() { adapterErrors[i] = item.close(ctx) })
 		}
-		if err := <-closed; err != nil {
-			result = errors.Join(result, r.app.serveProblem(err, "Mount retirement"))
+	}
+	finished.Wait()
+	for i, err := range adapterErrors {
+		if err != nil {
+			result = errors.Join(result, r.app.serveProblem(err, "Adapter at %q", r.Endpoints[i].info.Listen))
 		}
+	}
+	if coreErr != nil {
+		result = errors.Join(result, r.app.serveProblem(coreErr, "Mount retirement"))
 	}
 	return result
 }

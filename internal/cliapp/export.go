@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"net"
 	"path/filepath"
 	"regexp"
@@ -18,9 +19,11 @@ import (
 	core "github.com/nostalume/mountweave"
 )
 
+type exportProtocol string
+
 var (
 	exportProtocols     = []string{"webdav", "http", "sftp", "ftp", "s3"}
-	exportPortOverrides = map[string]string{"sftp": "2222", "ftp": "2121", "s3": "9000"}
+	exportPortOverrides = map[exportProtocol]string{"sftp": "2222", "ftp": "2121", "s3": "9000"}
 )
 
 type Export struct {
@@ -52,33 +55,30 @@ func (e exportTLS) paths(base string) (cert, key string) {
 	return HostPath(base, e.CertFile), HostPath(base, e.KeyFile)
 }
 
-func (e Export) sshKeyPaths(base string) (host, client string) {
-	return OptionalHostPath(base, e.HostKeyFile), OptionalHostPath(base, e.Auth.PublicKeyFile)
-}
-
 func (e Export) multipartDirectory(base string) string {
 	if e.S3 == nil || e.S3.Multipart == nil {
 		return ""
 	}
-	return HostPath(base, e.S3.Multipart.StateDirectory)
+	return e.S3.Multipart.directory(base)
 }
 
 func (e Export) validate() error {
 	host, port, err := net.SplitHostPort(e.Listen)
 	number, portErr := strconv.ParseUint(port, 10, 16)
 	user, ref := e.Auth.Username, e.Auth.Credential
+	protocol := exportProtocol(e.Protocol)
 	if err != nil || portErr != nil || number == 0 ||
 		!slices.Contains(exportProtocols, e.Protocol) ||
 		!slices.Contains([]string{"", "read", "read_write"}, e.Access) {
 		return InvalidConfig("An export needs a supported protocol, listener and access policy.")
 	}
-	if e.CreateOnly && (e.Protocol != "webdav" || e.Access != "read_write") {
+	if e.CreateOnly && (protocol != "webdav" || e.Access != "read_write") {
 		return InvalidConfig("Create-only publication requires a read-write WebDAV export.")
 	}
-	if e.PassivePorts != nil && (e.Protocol != "ftp" || e.PassivePorts.First == 0 || e.PassivePorts.Last < e.PassivePorts.First) {
+	if e.PassivePorts != nil && (protocol != "ftp" || e.PassivePorts.First == 0 || e.PassivePorts.Last < e.PassivePorts.First) {
 		return InvalidConfig("FTP passive ports need an ordered range of ports from 1 to 65535.")
 	}
-	if e.Protocol == "s3" {
+	if protocol == "s3" {
 		if e.S3 == nil || !bucketName.MatchString(e.S3.Bucket) || e.S3.MaxPutBytes < 0 ||
 			e.S3.Region != "" && !sigV4Name(e.S3.Region) || !sigV4Name(e.Auth.AccessKeyID) {
 			return InvalidConfig("S3 needs a bucket, a valid signing region and access key ID, and a nonnegative PUT limit.")
@@ -92,7 +92,7 @@ func (e Export) validate() error {
 		return InvalidConfig("Bucket and access key ID settings are only used by S3 exports.")
 	}
 	invalidUsername := !utf8.ValidString(user) || strings.ContainsFunc(user, unicode.IsControl)
-	if e.Protocol == "sftp" {
+	if protocol == "sftp" {
 		if e.TLS != nil || ref != nil || strings.TrimSpace(e.HostKeyFile) == "" || strings.TrimSpace(e.Auth.PublicKeyFile) == "" ||
 			strings.TrimSpace(user) == "" || invalidUsername {
 			return InvalidConfig("SFTP needs an SSH host key file, username and client public key file.")
@@ -105,9 +105,9 @@ func (e Export) validate() error {
 	if !ref.Valid() || (ref.Kind != "env" && ref.Kind != "file") {
 		return InvalidConfig("An export needs an env or file credential reference.")
 	}
-	if e.usesPassword() != (user != "") || invalidUsername ||
-		e.Protocol == "webdav" && strings.ContainsRune(user, ':') ||
-		e.Protocol == "ftp" && strings.TrimSpace(user) == "" {
+	if protocol.usesPassword() != (user != "") || invalidUsername ||
+		protocol == "webdav" && strings.ContainsRune(user, ':') ||
+		protocol == "ftp" && strings.TrimSpace(user) == "" {
 		return InvalidConfig("WebDAV and FTP need a valid username. Use the protocol's authentication fields.")
 	}
 	if e.TLS != nil {
@@ -120,25 +120,19 @@ func (e Export) validate() error {
 	return nil
 }
 
-func (e Export) usesPassword() bool { return e.Protocol == "webdav" || e.Protocol == "ftp" }
+func (protocol exportProtocol) usesPassword() bool {
+	return protocol == "webdav" || protocol == "ftp"
+}
 
 func exportCredentialConflict() error {
 	return &Problem{Code: "credential_scope_conflict", Message: "An export credential is also referenced by a storage mount.", NextAction: "Use separate credentials for clients and storage."}
 }
 
-func (e Export) containsMount(at string) bool {
-	if e.Protocol == "s3" {
-		return e.Root == at
-	}
-	return core.Within(e.Root, at)
-}
-
-func (e Export) checkCredential(saved ConfigSnapshot) error {
+func (e Export) checkCredential(base string, sources iter.Seq[MountRecord]) error {
 	if e.Auth.Credential == nil {
 		return nil
 	}
-	base := filepath.Dir(saved.Path)
-	for m := range SourceRecords(saved.Value.Mounts...) {
+	for m := range sources {
 		if sameReference(e.Auth.Credential, m.Credential, base) {
 			return exportCredentialConflict()
 		}
@@ -146,14 +140,20 @@ func (e Export) checkCredential(saved ConfigSnapshot) error {
 	return nil
 }
 
-func (e Export) scope() exportScope {
-	return exportScope{root: e.Root, writable: e.Access == "read_write", keys: e.Protocol == "s3"}
+func (e Export) scope() exportScope { return exportProtocol(e.Protocol).scope(e) }
+
+func (protocol exportProtocol) scope(e Export) exportScope {
+	return exportScope{root: e.Root, writable: e.Access == "read_write", keys: protocol == "s3"}
 }
 
 type exportScope struct {
 	root     string
 	writable bool
 	keys     bool
+}
+
+func (s exportScope) containsMount(at string) bool {
+	return s.root == at || !s.keys && core.Within(s.root, at)
 }
 
 func (s exportScope) allows(action core.Action, addr core.Address) bool {
@@ -208,6 +208,8 @@ type s3MultipartOptions struct {
 	RetentionSeconds int64  `json:"retention_seconds,omitempty"`
 }
 
+func (m s3MultipartOptions) directory(base string) string { return HostPath(base, m.StateDirectory) }
+
 type portRange struct {
 	First uint16 `json:"first"`
 	Last  uint16 `json:"last"`
@@ -223,9 +225,7 @@ func addExport(ctx context.Context, saved ConfigSnapshot, a arguments, in io.Rea
 	var err error
 	var ask Prompt
 	if a.from == "" {
-		if closer, ok := in.(io.Closer); ok {
-			defer closeOnCancel(ctx, closer)()
-		}
+		defer closeOnCancel(ctx, in)()
 		ask = promptInput(in, out)
 		e, err = promptExport(ask)
 	} else {
@@ -256,7 +256,7 @@ func addExport(ctx context.Context, saved ConfigSnapshot, a arguments, in io.Rea
 			return nil, "", err
 		}
 	}
-	if err := e.checkCredential(saved); err != nil {
+	if err := e.checkCredential(filepath.Dir(saved.Path), CredentialRecords(saved.Value.Mounts)); err != nil {
 		return receipt, "", err
 	}
 	if err := CheckStorageLocations(saved, false); err != nil {
@@ -274,24 +274,29 @@ func promptExport(ask Prompt) (e Export, err error) {
 	if e.Protocol, err = AskChoice(ask, "Protocol ("+strings.Join(exportProtocols, ", ")+")", "webdav", exportProtocols...); err != nil {
 		return e, err
 	}
+	protocol := exportProtocol(e.Protocol)
 	rootLabel := "Mounted directory (for example /files)"
-	if e.Protocol == "s3" {
+	if protocol == "s3" {
 		rootLabel = "Object mount (for example /objects)"
 	}
 	if e.Root, err = ask(rootLabel, ""); err != nil {
 		return e, err
 	}
-	port := cmp.Or(exportPortOverrides[e.Protocol], "8787")
+	e.Root = mountedPath(e.Root, true)
+	if err = core.ValidatePath(e.Root); err != nil {
+		return e, err
+	}
+	port := cmp.Or(exportPortOverrides[protocol], "8787")
 	if e.Listen, err = ask("Listen address", "127.0.0.1:"+port); err != nil {
 		return e, err
 	}
 	if e.Access, err = AskChoice(ask, "Access (read or read_write)", "read", "read", "read_write"); err != nil {
 		return e, err
 	}
-	if err := e.promptCredential(ask); err != nil {
+	if err := e.promptCredential(ask, protocol); err != nil {
 		return e, err
 	}
-	if e.Protocol == "ftp" {
+	if protocol == "ftp" {
 		raw, err := ask("Passive ports (empty for automatic, or FIRST-LAST)", "")
 		if err != nil {
 			return e, err
@@ -306,7 +311,7 @@ func promptExport(ask Prompt) (e Export, err error) {
 			e.PassivePorts = &portRange{uint16(lo), uint16(hi)}
 		}
 	}
-	if e.Protocol == "s3" && e.Access == "read_write" {
+	if protocol == "s3" && e.Access == "read_write" {
 		state, err := ask("Multipart state directory (empty to disable)", "")
 		if err != nil {
 			return e, err
@@ -330,10 +335,10 @@ func promptExport(ask Prompt) (e Export, err error) {
 	return e, nil
 }
 
-func (e *Export) promptCredential(ask Prompt) (err error) {
+func (e *Export) promptCredential(ask Prompt, protocol exportProtocol) (err error) {
 	label := "Bearer token"
 	switch {
-	case e.Protocol == "sftp":
+	case protocol == "sftp":
 		if err := AskFields(ask, Field("Username", &e.Auth.Username),
 			Field("SSH host private key file", &e.HostKeyFile), Field("Client public key file", &e.Auth.PublicKeyFile)); err != nil {
 			return err
@@ -346,13 +351,13 @@ func (e *Export) promptCredential(ask Prompt) (err error) {
 			}
 		}
 		return nil
-	case e.Protocol == "s3":
+	case protocol == "s3":
 		e.S3 = &S3ExportOptions{Region: DefaultS3Region}
 		if err := AskFields(ask, Field("Bucket", &e.S3.Bucket), Field("Signing region", &e.S3.Region), Field("Access key ID", &e.Auth.AccessKeyID)); err != nil {
 			return err
 		}
 		label = "Secret access key"
-	case e.usesPassword():
+	case protocol.usesPassword():
 		if e.Auth.Username, err = ask("Username", ""); err != nil {
 			return err
 		}

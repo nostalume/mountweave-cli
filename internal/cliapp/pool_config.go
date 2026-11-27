@@ -27,27 +27,25 @@ func PoolRoute(build PoolBuilder) Route {
 	return r
 }
 
-func (app *App) openPool(ctx context.Context, src MountSource, saved ConfigSnapshot, m, prior MountRecord, initialize bool) (_ core.Driver, err error) {
+func (app *App) openPool(ctx context.Context, src MountSource, saved ConfigSnapshot, m MountRecord, peers iter.Seq[MountRecord], initialize bool) (_ core.Driver, err error) {
 	opts := *src.pool
 	base := filepath.Dir(saved.Path)
-	sources := make([]MountSource, len(opts.Members))
-	var references []MountRecord
+	prepared := make([]struct {
+		open  sourceOpener
+		route *Route
+	}, len(opts.Members))
 	for i, member := range opts.Members {
 		record := member.Record(m.At)
 		s, err := PrepareMountSource(app, record, base)
 		if err == nil {
-			if record.Credential != nil && references == nil {
-				references = slices.Collect(SourceRecords(saved.Value.Mounts...))
-				references = slices.AppendSeq(references, SourceRecords(prior))
-			}
-			err = CheckAudience(app, record, s, saved, slices.Values(references))
+			prepared[i].open, err = admitMount(app, record, s, saved, peers)
 		}
 		if err != nil {
 			return nil, app.memberProblem(member.ID, err)
 		}
-		sources[i] = s
+		prepared[i].route = s.Route
 	}
-	drivers := make([]core.Driver, len(sources))
+	drivers := make([]core.Driver, len(opts.Members))
 	defer func() {
 		for _, d := range slices.Backward(drivers) {
 			if d != nil {
@@ -59,10 +57,10 @@ func (app *App) openPool(ctx context.Context, src MountSource, saved ConfigSnaps
 		if member.Offline {
 			continue
 		}
-		s := sources[i]
-		d, err := s.OpenDriver(ctx, member.Credential, base)
+		source := prepared[i]
+		d, err := openDriver(ctx, source.open, member.Credential, base)
 		if err != nil {
-			return nil, app.memberProblem(member.ID, s.Route.ProjectError(err))
+			return nil, app.memberProblem(member.ID, source.route.ProjectError(err))
 		}
 		drivers[i] = d
 		if support, ok := d.(core.NamespaceSupport); ok && !support.SupportsNamespace(core.TreeNamespace) {
@@ -74,6 +72,9 @@ func (app *App) openPool(ctx context.Context, src MountSource, saved ConfigSnaps
 	}
 	d, err := src.Route.pool(ctx, opts, initialize, drivers)
 	if err == nil {
+		if d == nil {
+			return nil, InvalidConfig("The Pool constructor did not return a Driver.")
+		}
 		drivers = nil // The Pool owns the members after construction.
 		if ctx.Err() != nil {
 			return nil, errors.Join(ctx.Err(), d.Close())
@@ -136,16 +137,23 @@ func validatePool(m MountRecord) error {
 	return nil
 }
 
-func SourceRecords(mounts ...MountRecord) iter.Seq[MountRecord] {
+// CredentialRecords reuses public records. File identity is checked at admission.
+func CredentialRecords(mounts []MountRecord, prior ...MountRecord) iter.Seq[MountRecord] {
+	var records []MountRecord
 	return func(yield func(MountRecord) bool) {
+		if len(prior) != 0 {
+			mounts = slices.Concat(mounts, prior)
+		}
 		for _, mount := range mounts {
 			sources, _ := mount.sources()
 			for source := range sources {
-				if !yield(source.record) {
-					return
+				if source.record.Credential != nil {
+					records = append(records, source.record)
 				}
 			}
 		}
+		mounts, prior = nil, nil
+		slices.Values(records)(yield)
 	}
 }
 

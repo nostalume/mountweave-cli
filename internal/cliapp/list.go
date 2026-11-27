@@ -12,10 +12,12 @@ import (
 	core "github.com/nostalume/mountweave"
 )
 
-func (app *App) list(ctx context.Context, c *core.Core, a arguments, address core.Address, out, diagnostics io.Writer, project fileErrorProjection) int {
-	var err error
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (app *App) list(ctx context.Context, c *core.Core, a arguments, address core.Address, out, diagnostics io.Writer, project fileErrorProjection, release func(string) error) int {
+	out, finish, err := prepareStream(ctx, out, true)
+	if err != nil {
+		return app.listOutputFailed(diagnostics, release(""))
+	}
+	defer finish(nil)
 
 	buffer := bufio.NewWriter(out)
 	encoder := json.NewEncoder(buffer)
@@ -55,7 +57,11 @@ func (app *App) list(ctx context.Context, c *core.Core, a arguments, address cor
 				}
 				outputErr = encoder.Encode(entry)
 			} else {
-				_, outputErr = fmt.Fprintf(buffer, "%s\t%q\n", entry.Kind, entry.Name)
+				name := displayText(entry.Name)
+				if entry.Kind == core.Directory {
+					name += "/"
+				}
+				_, outputErr = fmt.Fprintln(buffer, name)
 			}
 			if outputErr != nil {
 				break
@@ -73,13 +79,11 @@ func (app *App) list(ctx context.Context, c *core.Core, a arguments, address cor
 			break
 		}
 	}
-	cancel()
-	// Core.Close invalidates any remaining cursor before retiring the mount.
-	err = errors.Join(err, CloseRuntime(c))
+	retirement := release(req.Cursor)
 	if outputErr != nil {
-		outputFailure(diagnostics)
-		return 1
+		return app.listOutputFailed(diagnostics, retirement)
 	}
+	err = errors.Join(err, retirement)
 	p := AppProblem(app, err)
 	if a.json {
 		if err != nil {
@@ -88,11 +92,18 @@ func (app *App) list(ctx context.Context, c *core.Core, a arguments, address cor
 		body, encodeErr := json.Marshal(p)
 		_, writeErr := fmt.Fprintf(buffer, `],"state":%q},"error":%s}`+"\n", state, body)
 		if encodeErr != nil || writeErr != nil || buffer.Flush() != nil {
-			outputFailure(diagnostics)
-			return 1
+			return app.listOutputFailed(diagnostics, retirement)
 		}
 	} else if p != nil {
 		printProblem(diagnostics, p)
 	}
 	return status(p)
+}
+
+func (app *App) listOutputFailed(diagnostics io.Writer, retirement error) int {
+	outputFailure(diagnostics)
+	if retirement != nil {
+		fmt.Fprintf(diagnostics, "shutdown_failed: Mount retirement. %s\n", AppProblem(app, retirement).Message)
+	}
+	return 1
 }

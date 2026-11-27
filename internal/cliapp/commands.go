@@ -48,6 +48,11 @@ func (o optionSpec) syntax() string {
 
 var commonOptions = []optionID{helpOption, configOption, jsonOption, timeoutOption}
 
+const (
+	localFileOperand = "FILE|-"
+	treePathOperand  = "PATH"
+)
+
 type commandSpec struct {
 	name, summary    string
 	operands         []string
@@ -59,21 +64,26 @@ type commandSpec struct {
 	children         []commandSpec
 }
 
+var fileCommands = []commandSpec{
+	{name: "ls", summary: "List directory contents. Defaults to the mounted root (/).", operands: []string{"ADDRESS"}, options: []optionID{limitOption}},
+	{name: "stat", summary: "Show information about a file or directory.", operands: []string{"ADDRESS"}, required: 1},
+	{name: "get", summary: "Download to a local file or stdout.", operands: []string{"ADDRESS", localFileOperand}, required: 2},
+	{name: "put", summary: "Upload from a local file or stdin.", operands: []string{localFileOperand, "ADDRESS"}, required: 2, options: []optionID{replaceOption, sizeOption}},
+	{name: "cp", summary: "Copy to an exact path or into a directory ending in /.", operands: []string{"SOURCE", "TARGET"}, required: 2, options: []optionID{recursiveOption, replaceOption}},
+	{name: "mv", summary: "Move to an exact path or into a directory ending in /.", operands: []string{"SOURCE", "TARGET"}, required: 2},
+	{name: "mkdir", summary: "Create a directory.", operands: []string{treePathOperand}, required: 1},
+	{name: "trash", summary: "Move one file to the recycle bin.", operands: []string{"ADDRESS"}, required: 1},
+	{name: "remove", summary: "Permanently delete one file.", operands: []string{"ADDRESS"}, required: 1},
+	{name: "rmdir", summary: "Permanently delete an empty directory.", operands: []string{treePathOperand}, required: 1},
+}
+
 var commandSections = []struct {
 	title    string
 	commands []commandSpec
 }{
-	{"Work with files", []commandSpec{
-		{name: "ls", summary: "List directory contents.", operands: []string{"ADDRESS"}, required: 1, options: []optionID{limitOption}},
-		{name: "stat", summary: "Show information about a file or directory.", operands: []string{"ADDRESS"}, required: 1},
-		{name: "get", summary: "Download to a local file or stdout.", operands: []string{"ADDRESS", "FILE|-"}, required: 2},
-		{name: "put", summary: "Upload from a local file or stdin.", operands: []string{"FILE|-", "ADDRESS"}, required: 2, options: []optionID{replaceOption, sizeOption}},
-		{name: "cp", summary: "Copy to an exact mounted address.", operands: []string{"SOURCE", "TARGET"}, required: 2, options: []optionID{recursiveOption, replaceOption}},
-		{name: "mv", summary: "Move to an exact mounted address.", operands: []string{"SOURCE", "TARGET"}, required: 2},
-		{name: "mkdir", summary: "Create a directory.", operands: []string{"PATH"}, required: 1},
-		{name: "rm", summary: "Remove a file or an explicitly selected tree.", operands: []string{"ADDRESS"}, required: 1, options: []optionID{recursiveOption}},
-		{name: "rmdir", summary: "Remove an empty directory.", operands: []string{"PATH"}, required: 1},
-	}},
+	{"Work with files", append(slices.Clip(fileCommands), commandSpec{
+		name: "shell", summary: "Run file commands in an interactive session.", operands: []string{treePathOperand}, foreground: true,
+	})},
 	{"Access over protocols", []commandSpec{
 		{name: "serve", summary: "Serve configured exports in the foreground.", foreground: true},
 	}},
@@ -81,7 +91,7 @@ var commandSections = []struct {
 		{name: "mount", summary: "Manage saved mounts.", children: []commandSpec{
 			{name: "add", summary: "Set up a mount.", operands: []string{"PATH"}, options: []optionID{fromOption}, exclusiveOperand: fromOption, showSources: true},
 			{name: "list", summary: "List saved mounts."},
-			{name: "edit", summary: "Edit a saved mount.", operands: []string{"PATH"}, required: 1, options: []optionID{fromOption}},
+			{name: "edit", summary: "Edit a saved mount. Omit PATH to choose one interactively.", operands: []string{"PATH"}, options: []optionID{fromOption}},
 			{name: "remove", summary: "Remove a saved mount.", operands: []string{"PATH"}, required: 1},
 		}},
 		{name: "export", summary: "Manage saved protocol exports.", children: []commandSpec{
@@ -95,35 +105,34 @@ var commandSections = []struct {
 }
 
 type arguments struct {
-	command, config, from string
-	operands              []string
-	help, json            bool
-	limit                 int
-	timeout               time.Duration
-	replace, recursive    bool
-	size                  *int64
+	command                commandSpec
+	config, from           string
+	commandWords, operands []string
+	help, json             bool
+	limit                  int
+	timeout                time.Duration
+	replace, recursive     bool
+	size                   *int64
 }
 
 func findCommand(words []string) (commandSpec, int) {
 	for _, section := range commandSections {
-		for _, command := range section.commands {
-			if command.name != words[0] {
-				continue
-			}
-			if len(words) == 1 || len(command.children) == 0 {
-				return command, 1
-			}
-			for _, child := range command.children {
-				if child.name == words[1] {
-					return child, 2
-				}
-			}
+		i := slices.IndexFunc(section.commands, func(c commandSpec) bool { return c.name == words[0] })
+		if i < 0 {
+			continue
+		}
+		command := section.commands[i]
+		if len(words) == 1 || len(command.children) == 0 {
+			return command, 1
+		}
+		if i := slices.IndexFunc(command.children, func(c commandSpec) bool { return c.name == words[1] }); i >= 0 {
+			return command.children[i], 2
 		}
 	}
 	return commandSpec{}, 0
 }
 
-func parse(args []string) (arguments, commandSpec, error) {
+func parse(args []string) (arguments, error) {
 	var a arguments
 	var words []string
 	var seen [len(options)]bool
@@ -144,26 +153,26 @@ func parse(args []string) (arguments, commandSpec, error) {
 		}
 		index := slices.IndexFunc(options[:], func(o optionSpec) bool { return o.name == name })
 		if index <= 0 {
-			return a, commandSpec{}, usage("Unknown option. Run mweave help.")
+			return a, usage("Unknown option. Run mweave help.")
 		}
 		id := optionID(index)
 		if seen[id] {
-			return a, commandSpec{}, usage("An option was provided more than once.")
+			return a, usage("An option was provided more than once.")
 		}
 		seen[id] = true
-		if options[id].value == "" {
-			if inline {
-				return a, commandSpec{}, usage("This option does not take a value.")
-			}
-		} else if !inline {
+		takesValue := options[id].value != ""
+		switch {
+		case inline && !takesValue:
+			return a, usage("This option does not take a value.")
+		case !inline && takesValue:
 			i++
 			if i == len(args) || strings.HasPrefix(args[i], "--") {
-				return a, commandSpec{}, usage("An option value is missing.")
+				return a, usage("An option value is missing.")
 			}
 			value = args[i]
 		}
-		if options[id].value != "" && value == "" {
-			return a, commandSpec{}, usage("An option value is empty.")
+		if takesValue && value == "" {
+			return a, usage("An option value is empty.")
 		}
 		switch id {
 		case helpOption:
@@ -181,66 +190,70 @@ func parse(args []string) (arguments, commandSpec, error) {
 		case sizeOption:
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n < 0 {
-				return a, commandSpec{}, usage("--size requires a nonnegative byte count.")
+				return a, usage("--size requires a nonnegative byte count.")
 			}
 			a.size = &n
 		case limitOption:
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 1 {
-				return a, commandSpec{}, usage("--limit requires a positive integer.")
+				return a, usage("--limit requires a positive integer.")
 			}
 			a.limit = n
 		case timeoutOption:
 			d, err := time.ParseDuration(value)
 			if err != nil || d <= 0 {
-				return a, commandSpec{}, usage("--timeout requires a positive duration, such as 10s.")
+				return a, usage("--timeout requires a positive duration, such as 10s.")
 			}
 			a.timeout = d
 		}
 	}
 
-	var command commandSpec
-	if len(words) == 0 {
-		a.help = true
-	} else {
-		var depth int
-		command, depth = findCommand(words)
-		if depth == 0 {
-			return a, command, usage("Unknown command. Run mweave help.")
+	if len(words) != 0 {
+		if words[0] == "rm" {
+			return a, usage("Use trash for recoverable file deletion, remove for permanent file deletion, or rmdir for an empty directory. Recursive deletion is unavailable in the CLI.")
 		}
-		a.command = strings.Join(words[:depth], " ")
-		a.operands = words[depth:]
-		a.help = a.help || a.command == "help" || len(command.children) != 0
+		command, depth := findCommand(words)
+		if depth == 0 {
+			return a, usage("Unknown command. Run mweave help.")
+		}
+		a.command, a.commandWords, a.operands = command, words[:depth], words[depth:]
 	}
+	command := a.command
+	a.help = a.help || command.name == "" || command.name == "help" || len(command.children) != 0
 	for id, supplied := range seen {
 		if supplied && !slices.Contains(commonOptions, optionID(id)) && !slices.Contains(command.options, optionID(id)) {
-			return a, command, usage("This option is unavailable for the selected command.")
+			return a, usage("This option is unavailable for the selected command.")
 		}
 	}
 	if command.exclusiveOperand != noOption && seen[command.exclusiveOperand] && len(a.operands) != 0 {
-		return a, command, usage("Provide a mount path or a complete record through --from.")
+		return a, usage("Provide a mount path or a complete record through --from.")
 	}
 	if len(a.operands) > len(command.operands) || (!a.help && len(a.operands) < command.required) {
-		return a, command, usage("Invalid operands. Run mweave " + a.command + " --help.")
+		return a, usage("Invalid operands. Run mweave " + strings.Join(a.commandWords, " ") + " --help.")
 	}
-	if !a.help {
-		switch {
-		case a.command == "get" && a.operands[1] == "-" && a.json:
-			return a, command, usage("Use either stdout for the download or --json with a local destination.")
-		case a.size != nil && a.operands[0] != "-":
-			return a, command, usage("--size applies to put from stdin.")
-		case a.recursive && a.replace:
-			return a, command, usage("--replace applies to single-file copies.")
-		case command.foreground && a.timeout != 0:
-			return a, command, usage("--timeout applies to one-shot commands. Stop serve with an interrupt.")
-		}
+	switch {
+	case a.help:
+	case command.name == "edit" && len(a.commandWords) == 2 && a.commandWords[0] == "mount" &&
+		len(a.operands) == 0 && (a.json || a.from != ""):
+		return a, usage("Provide a mount path when using --from or --json.")
+	case command.name == "shell" && a.json:
+		return a, usage("--json applies to individual file commands in shell.")
+	case command.name == "get" && a.operands[1] == "-" && a.json:
+		return a, usage("Use either stdout for the download or --json with a local destination.")
+	case a.size != nil && a.operands[0] != "-":
+		return a, usage("--size applies to put from stdin.")
+	case a.recursive && a.replace:
+		return a, usage("--replace applies to single-file copies.")
+	case command.foreground && a.timeout != 0:
+		return a, usage("--timeout applies to individual operations.")
 	}
-	return a, command, nil
+	return a, nil
 }
 
-func (app *App) helpText(a arguments, command commandSpec) string {
+func (app *App) helpText(a arguments) string {
+	command := a.command
 	var text strings.Builder
-	if a.command == "" || a.command == "help" {
+	if command.name == "" || command.name == "help" {
 		text.WriteString("Usage: mweave [--config FILE] COMMAND\n")
 		for _, section := range commandSections {
 			fmt.Fprintf(&text, "\n%s\n", section.title)
@@ -250,7 +263,7 @@ func (app *App) helpText(a arguments, command commandSpec) string {
 		return text.String()
 	}
 
-	name := "mweave " + a.command
+	name := "mweave " + strings.Join(a.commandWords, " ")
 	if len(command.children) != 0 {
 		fmt.Fprintf(&text, "Usage: %s COMMAND\n\n%s\n\n", name, command.summary)
 		printCommands(&text, command.children)
@@ -276,7 +289,7 @@ func (app *App) helpText(a arguments, command commandSpec) string {
 	fmt.Fprintf(&text, "\n\n%s\n\nOptions\n", command.summary)
 	for _, ids := range [][]optionID{command.options, commonOptions} {
 		for _, id := range ids {
-			if command.foreground && id == timeoutOption {
+			if command.foreground && (id == timeoutOption || command.name == "shell" && id == jsonOption) {
 				continue
 			}
 			option := options[id]
@@ -285,7 +298,7 @@ func (app *App) helpText(a arguments, command commandSpec) string {
 	}
 	if command.showSources {
 		text.WriteString("\nAvailable sources\n")
-		_ = app.printSources(&text, app.sourceNames("", SourceConnection.available))
+		_ = app.printSources(&text, app.sourceNames("", SourceConnection.available), false)
 	}
 	return text.String()
 }

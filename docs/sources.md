@@ -9,7 +9,7 @@ For the full record format and common rules, see the
 For first-time sign-in, skip to [cloud authorization](#cloud-authorization).
 Managed authorization and saved website sessions require Windows or Linux.
 For file behavior, this page describes the CLI route; the
-[Mountweave capability matrix](https://github.com/nostalume/mountweave/blob/v0.3.0/docs/drivers.md)
+[Mountweave capability matrix](https://github.com/nostalume/mountweave/blob/v0.4.0/docs/drivers.md)
 covers the native Driver. Successful authorization does not imply write or
 delete access. The configured root, provider permissions and Driver capability
 all apply. Pool is an [optional build](#pool-mounts).
@@ -20,10 +20,11 @@ Choose a route based on what you already have.
 
 | What you have | Route and what to prepare |
 | --- | --- |
-| An ordinary account | Use website sign-in for [123 Cloud Drive](#connect-123-cloud-drive), [Aliyun Drive](#connect-aliyun-drive-through-the-website), [LanZou, Mobile Cloud, UC or Quark](#browser-based-file-access), or account consent for [Weiyun](#connect-tencent-weiyun). The wizard keeps the resulting authorization. |
-| Server or app credentials | Use [WebDAV presets](#webdav-presets) for Nutstore, 123 WebDAV or FEB. For WebDAV, SFTP, FTP and SMB, get the address and sign-in details from the service or server administrator. |
-| An approved or configured application | Get application settings before setup for [Aliyun Drive Open](#connect-aliyun-drive-open), [115 Open](#connect-115-open), [123 Open](#connect-123-open), [Dropbox](#connect-dropbox), [Google Drive](#connect-google-drive) or [Microsoft Graph](#connect-microsoft-graph). The provider may require an eligible account or administrator consent. |
-| A provider token or API key | Use `reference` where offered. For a personal [PikPak](#connect-pikpak) drive, create a read-only access token. See [drive and team integrations](#drive-and-team-integrations) for other service-specific inputs. |
+| An ordinary account | Use [website sign-in](#browser-based-file-access) or account consent for [Weiyun](#connect-tencent-weiyun). The wizard keeps the resulting authorization. |
+| Server or app credentials | Use a [WebDAV preset](#webdav-presets) if the service has issued your account a collection and app password. For WebDAV, SFTP, FTP and SMB, get the address and sign-in details from the service or server administrator. |
+| Your own OAuth client | Create a client for personal use in [Dropbox](#connect-dropbox) or [Google Drive](#connect-google-drive). |
+| A provider-approved application | Use the settings issued for [Aliyun Drive Open](#connect-aliyun-drive-open), [115 Open](#connect-115-open) or [123 Open](#connect-123-open). For [Microsoft Graph](#connect-microsoft-graph) or enterprise sources, check your organization's access policy. |
+| A provider token or API key | Use `reference` where offered. For [PikPak](#connect-pikpak), create a read-only personal access token. For other services, request a credential with access to the selected account or space. See [drive and team integrations](#drive-and-team-integrations) for service-specific inputs. |
 | An S3 bucket and credentials | Use [S3-compatible storage](#s3-compatible-storage) with credentials issued for that bucket, normally through the AWS SDK credential chain or a named profile. |
 
 Run `mweave mount add /cloud`, choose the service and complete its sign-in or
@@ -44,6 +45,17 @@ or `ls key:/cloud:` for an object mount to check access.
 
 When a folder prompt accepts both a path and an ID, start a path with `/`.
 Enter `-` at that prompt to restore its default during editing.
+
+### Network reachability
+
+Check both the provider API and an original file from the machine running
+mweave. A successful directory listing only proves API reachability.
+If your network needs a proxy for an HTTP-backed provider, set `HTTP_PROXY`
+for HTTP and `HTTPS_PROXY` for HTTPS in the mweave process. Check that
+`NO_PROXY` does not bypass a required route. PikPak worked in our acceptance
+test when both the HTTPS grant and the issued file URL used the same route.
+[Go proxy selection](https://pkg.go.dev/net/http#ProxyFromEnvironment) ·
+[PikPak network guidance](https://mypikpak.com/en-US/faq)
 
 ## Provider-specific access
 
@@ -72,9 +84,31 @@ to the bucket. Its operator account supplies the password credential.
 
 ### Drive and team integrations
 
-For Baidu Netdisk, obtain an access token authorized for the Baidu developer
+Choose Baidu Netdisk, then Website sign-in when adding
+a mount. Sign in once in the dedicated browser profile and choose a folder.
+Use `mweave get /baidu/path/to/file.zip file.zip` when the website offers
+ordinary browser download for that file.
+
+For the Open API connection, obtain an access token authorized for the Baidu developer
 application and account. Choose an absolute directory covered by that grant.
 The granted directory can be narrower than the account root.
+
+Choose MediaFire and Website sign-in. Complete sign-in
+on MediaFire and close the dedicated browser window after My Files appears.
+The browser restores the MediaFire session from its local profile. Mountweave
+checks that the account and selected folder still match when the mount reopens.
+Use `mweave get` for whole-file downloads offered by the website. Use `put FILE ADDRESS` to create a nonempty file and
+`mkdir ADDRESS` to create a directory. Both refuse an occupied name.
+Uploads use a private local staging area with an 8 GiB limit per mount.
+Reconnect the mount if MediaFire asks you to sign in again.
+
+For PikPak setup, see [Connect PikPak](#connect-pikpak).
+
+The wizard also offers website sign-in for Guangya Pan and Tianyi Cloud
+Drive personal accounts. Sign in, open your files, close the browser window,
+and choose the folder to mount. The website determines which files are
+eligible for ordinary whole-file downloads. Guangya Pan also offers the Open
+API connection for approved applications.
 
 Set Google Drive's `export_formats` in a mount record to map a Workspace
 MIME type to an output MIME type, for example
@@ -192,28 +226,52 @@ and check that the app or account has the desired folder permissions.
 | Service | Where to get the values |
 | --- | --- |
 | Nutstore (`nutstore`) | The wizard offers the Nutstore address. Use your account email and generate a third-party app password in [Nutstore settings](https://help.jianguoyun.com/?p=5677). |
-| 123 Cloud Drive (`pan123` → `webdav`) | Choose `existing` if you have the WebDAV values. Choose `setup` to open 123 Cloud Drive and create an app for the folder under Tools → Third-party mounting. Use its username and password. Choose the service-issued URL or accept the default. [123 WebDAV guide](https://www.weibo.com/ttarticle/p/show?id=2309405214103219339373) |
-| FEB (`febbox`) | In the FEB console, open Settings → WebDAV and create an account for the folder. FEB supplies the URL, username and password. The wizard prints the setup address if it cannot open a browser. [FEB WebDAV](https://www.febbox.com/faq) |
+| 123 Cloud Drive (`pan123` → `webdav`) | Use `existing` with a valid WebDAV collection and app password. `setup` opens the provider's site. Check whether your account still offers Tools → Third-party mounting before choosing this route. [123 WebDAV guide](https://www.weibo.com/ttarticle/p/show?id=2309405214103219339373) |
+| FEB (`febbox`) | In Console → Settings → WebDAV, check whether your plan can create a WebDAV account. Use the issued collection, username and password. The account tested for migration required VIP. [FEB WebDAV](https://www.febbox.com/faq) |
 
 ## Browser-based file access
 
-These sources reuse the protected website session created during setup.
-Use `mount edit PATH` if sign-in expires and select the original account
-and folder.
+Choose Website sign-in for Aliyun Drive, Baidu Netdisk, 115 Cloud Drive,
+123 Cloud Drive, Guangya Pan, MediaFire or Tianyi Cloud Drive. LanZou,
+China Mobile Cloud, UC and Quark use website sign-in directly. These sources
+reuse the local browser profile created during setup. Use `mount edit PATH`
+if sign-in expires and select the original account and folder. The `trash` command moves one regular file to the
+recycle bin on 115, UC, MediaFire, Quark, Tianyi and writable Aliyun website
+mounts. Tianyi and Guangya
+Pan website mounts support `mv` for renaming a regular file within its
+current directory. An occupied destination is refused. For MediaFire, China
+Mobile Cloud, 123 Cloud Drive and Guangya Pan website mounts, use `mv FILE DIR/`
+to move a file into another existing directory on the same mount. The result
+prints the actual path chosen by the service. Use `mkdir` on a Guangya Pan
+website mount to create a directory with an unoccupied name. On a writable
+WebDAV export of a MediaFire website mount, deleting a collection moves it
+and its descendants to MediaFire Trash.
 
 ### Browse a LanZou Cloud account
 
 `lanzou` browses private folders. Downloads use the file's existing share
 through the password-protected LanZou download page.
 
-### Browse a China Mobile Cloud personal drive
+### Connect to a China Mobile Cloud personal drive
 
-`mobilepan` browses the personal drive and downloads original files.
+`mobilepan` browses the personal drive and downloads original files. Use `mkdir` to create a directory and `put FILE ADDRESS` to
+upload a nonempty file. Use `mv` to rename a regular file within its current
+directory. These operations reject names already used by a file or directory.
+The upload stages one file privately before sending its body to China Mobile Cloud.
+CLI `trash` requires confirmation that the file is recoverable through the
+website's recycle bin.
 
 ### Browse a UC Cloud Drive account
 
 `uc` reads nonempty files sequentially or with a single byte range.
 It uses the site's Download action for the selected file.
+
+### Connect 123 Cloud Drive
+
+Run `mweave mount add /123Pan`, choose `pan123` and select `website`.
+Sign in once and choose the folder to mount. Use `mweave ls /123Pan` to browse,
+`mweave get` for files eligible for ordinary download, and `mv` to rename a
+regular file in its current directory.
 
 ### Browse a Quark Cloud Drive account
 
@@ -239,12 +297,21 @@ A bucket can also be listed later with `ls key:/objects:`.
 
 In the [Dropbox App Console](https://www.dropbox.com/developers/apps),
 create or use a user-scoped app and enter its public app key in the wizard
-or set `MWEAVE_DROPBOX_APP_KEY`. Register the exact redirect
+or set `MWEAVE_DROPBOX_APP_KEY`. A development app can connect to your own
+Dropbox account. The CLI uses a public client with PKCE. Register the exact
+redirect
 `http://localhost:53682/callback` and enable `account_info.read`,
 `files.metadata.read` and `files.content.read`. The local port must be
-available during consent. For write access, enable `files.content.write`,
-set `allow_create` on the mount with `mount edit --from`, then reauthorize.
-[Dropbox OAuth flow](https://docs.dropboxapi.com/riviera/docs/get-started/authorization)
+available during consent. For a new writable mount, enable
+`files.content.write` on the app and select `read_write` in the wizard before
+authorizing. In JSON this is `options.allow_create: true`. A saved read-only
+grant needs new consent after changing its mount to read/write.
+`put` creates files and `mv` moves files or directories
+inside the same Dropbox mount. A complete target path requires an unused
+name. A destination ending in `/` lets Dropbox select a name on collision.
+Case-only renames are unavailable.
+[Dropbox OAuth flow](https://docs.dropboxapi.com/riviera/docs/get-started/authorization) ·
+[Development apps and production approval](https://docs.dropboxapi.com/dropbox-api/docs/developer-resources/developer-guide)
 
 The app's authorized root is the default. For a team namespace, get its
 `namespace_id` from the authorized Dropbox API or the team administrator.
@@ -254,19 +321,21 @@ scope needed by mounts sharing the grant in the selected configuration.
 
 ## Connect Google Drive
 
-In Google Cloud, enable the Drive API and download a Desktop OAuth client
-JSON file. Give the wizard the file path and consent to `drive.readonly`.
-The wizard uses a local port assigned by the operating system. For a shared
-drive, use its ID or a folder ID from the authorized Drive API or the
-workspace administrator.
-[Desktop app setup](https://developers.google.com/identity/protocols/oauth2/native-app) ·
+For your own account, create a Google Auth Platform project in **Personal**
+mode. Choose **Desktop app**, download the OAuth client JSON and enable the
+Drive API in that project. Give the wizard the JSON file path and consent to
+`drive.readonly` with the Google account that created the project.
+The wizard uses a local port assigned by the operating system.
+[Personal mode setup](https://support.google.com/cloud/answer/15544987) ·
 [Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
 
-For an external OAuth app in Testing, Google issues refresh tokens for this
-scope that expire after seven days. Public apps and managed accounts are
-subject to Google's verification and organization policies.
-[Google token expiration](https://developers.google.com/identity/protocols/oauth2/#expiration) ·
-[App state and organization policy](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview)
+Personal mode requires no OAuth app review and has no seven-day test token
+expiry. You can reuse an existing Desktop app client. Existing External or
+Internal projects cannot switch to Personal. An External project in Testing
+issues seven-day refresh tokens for this scope. Work or school accounts are
+subject to administrator policy. For a shared drive, use its ID or a folder ID
+from the authorized Drive API or the workspace administrator.
+[Google audience and publishing status](https://support.google.com/cloud/answer/15549945)
 
 ## Connect Aliyun Drive Open
 
@@ -291,6 +360,10 @@ a resource-drive folder. Keep the site's remember sign-in option enabled
 if offered. A plain-text page is the sign-in completion signal. The wizard
 sets up browsing and downloads. Supported repository writes use the
 [explicit Rustic export settings](specification.md#protocol-setup).
+
+With a configured `options.write`, use `put` to
+upload a new file of known size, `mv` to rename or move a file inside that
+mount, and `trash` to recycle a file. Move and upload refuse an occupied name.
 Stop a running `serve` before replacing its website session. If website
 verification fails, try the site's QR sign-in if available.
 
@@ -304,8 +377,10 @@ The `reference` route uses a personal MCP token issued by Weiyun.
 
 ## Connect 115 Open
 
-Get an approved App ID from 115 Open. Enter it on the `scan` route or set
-`MWEAVE_115_APP_ID`. Scan the displayed QR code with the 115 app.
+Get an approved App ID from 115 Open. Registering your own app requires
+developer and application review. Enter the approved App ID on the `scan`
+route or set `MWEAVE_115_APP_ID`, then scan the displayed QR code with the
+115 app.
 [115 Open developer registration](https://open.115.com/) ·
 [115 Open scan authorization](https://open.115.com/doc/115开放平台/接入指南/接入授权/手机扫码授权PKCE模式/获取设备码和二维码内容.md?raw=true)
 
@@ -315,14 +390,6 @@ configuration before replacing the grant. If refresh cannot be confirmed or
 115 rejects the token before its local expiry, reauthorize in `mount edit`.
 [115 Open refresh contract](https://open.115.com/doc/115开放平台/接入指南/接入授权/刷新access_token.md?raw=true)
 
-## Connect 123 Cloud Drive
-
-Choose `pan123` → `website` in `mweave mount add /cloud`. Sign in in the
-dedicated browser window, close it when your files appear, and choose a
-folder. The wizard saves the verified account and folder. Use `ls` to browse
-and `get` to read files for which the service offers ordinary downloads.
-The connection is read-only. To renew an expired sign-in, use `mount edit`.
-
 ## Connect 123 Open
 
 Choose `pan123` → `open` if you have a Client ID and Client Secret issued
@@ -330,6 +397,12 @@ by 123 Open for the account you intend to mount. Supply the ID and a secret
 reference. The CLI uses them to issue a short-lived access token and
 verifies the account UID. It resolves the secret again when it needs a new
 token. For an existing provider token, choose `reference`.
+
+Select `read_write` with a grant that has file write access. It enables
+`mkdir` and `put` for new names. For JSON settings, use
+`"allow_write": true`. The upload buffer defaults to 64 MiB. Set
+`max_upload_bytes` to increase it up to 1,000,000,000 bytes. Named local
+inputs have a known length. For stdin, provide `--size`.
 
 Use `mount edit` to reauthorize the same account. The CLI probes mounts
 in the selected configuration sharing that grant. Choose `switch` to
@@ -345,9 +418,9 @@ Access Token with **Read files** permission. Choose `pikpak` in
 Leave the folder ID empty to use the account root. The wizard generates a
 device ID and saves it with the mount.
 
-PikPak supports browsing, full downloads and single byte ranges. If the host
-needs a network proxy, set `HTTPS_PROXY` and `HTTP_PROXY` for the mweave
-process. The API uses HTTPS and the temporary file address can use HTTP.
+PikPak supports browsing, whole-file downloads and single byte ranges. Its
+API uses HTTPS. The temporary file address can use HTTP, so configure both
+proxy variables if your network requires a proxy.
 [PikPak permissions and network guidance](https://mypikpak.com/en-US/faq)
 
 ## Connect Microsoft Graph
@@ -365,13 +438,15 @@ request such as `GET /me/drives` or `GET /sites/{siteId}/drives`, or ask
 the organization's Graph administrator. Then select a folder in that
 drive. The managed device route uses global Microsoft Graph. Use an
 external token issued for the configured endpoint for other deployments.
+Graph supports `mkdir` in an ordinary drive with a write-authorized
+token. The managed device route requests read access.
 [List drives](https://learn.microsoft.com/en-us/graph/api/drive-list?view=graph-rest-1.0) ·
 [Graph deployments](https://learn.microsoft.com/en-us/graph/deployments)
 
 ## Pool mounts
 
-Build with `go build -tags mweave_pool -o mweave .` (use `mweave.exe` on
-Windows). Add a `pool` mount with `mount add --from FILE`:
+[Build with the Pool tag](../CONTRIBUTING.md#build-from-source), then add a
+`pool` mount with `mount add --from FILE`.
 
 ~~~json
 {
@@ -432,8 +507,8 @@ The installed binary lists available IDs in `mweave mount add --help`.
 | `webdav` | `root_url` selects the collection. Set `username` and a credential reference for Basic authentication, or omit both for anonymous access. |
 | `nutstore`, `febbox` | Use the provider's WebDAV username and app password. See [WebDAV presets](#webdav-presets). |
 | `pan115` | Use [phone scan authorization](#connect-115-open) or reference an existing access token. Select a folder with `root_path` or `root_id`, or omit both for the account root. |
-| `pan123` | Choose [website sign-in](#connect-123-cloud-drive) in the wizard, or use [Open API credentials](#connect-123-open). Open API accepts `root_path` or `root_id`, or both omitted for the account root. |
-| `pikpak` | Reference a [read-only personal access token](#connect-pikpak). The wizard generates `device_id`. Optional `root_id` selects a native folder. |
+| `pan123` | Use [website sign-in](#connect-123-cloud-drive) or [Open API credentials](#connect-123-open). Open API accepts `root_path` or `root_id`, or both omitted for the account root. |
+| `pikpak` | Reference a [read-only personal access token](#connect-pikpak). The wizard generates `device_id`. Optional `root_id` selects a folder. |
 | `baidupan` | Set `root_path` to an explicit absolute directory covered by your Baidu Netdisk authorization. Reference an existing access token. |
 | `graphdrive` | Set a known `drive_id` and a drive-relative `root_path` or `root_id`. Use `/` for the drive root. Choose [device authorization](#connect-microsoft-graph) for global Microsoft Graph, or reference an existing access token for the selected endpoint. |
 | `googledrive` | Use [browser authorization](#connect-google-drive) or reference an existing Drive access token. Set `root_id` or `root_path`, or omit both for the authorized root. Use a folder ID for a shared drive or one of its folders. |

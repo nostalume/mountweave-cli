@@ -16,10 +16,11 @@ import (
 )
 
 type mountSummary struct {
-	At              string `json:"at"`
-	Driver          string `json:"driver"`
-	DriverAvailable bool   `json:"driver_available"`
-	Connection      string `json:"connection,omitempty"`
+	At              string   `json:"at"`
+	Driver          string   `json:"driver"`
+	DriverAvailable bool     `json:"driver_available"`
+	Connection      string   `json:"connection,omitempty"`
+	Problem         *Problem `json:"problem,omitempty"`
 }
 
 type MountReceipt struct {
@@ -28,28 +29,19 @@ type MountReceipt struct {
 }
 
 func (app *App) runMount(ctx context.Context, saved ConfigSnapshot, a arguments, in io.Reader, diagnostics io.Writer) (any, string, error) {
-	if a.command != "mount list" {
+	if a.command.name != "list" {
 		return app.changeMount(ctx, saved, a, in, diagnostics)
 	}
-	items := make([]mountSummary, 0, len(saved.Value.Mounts))
+	items := app.mountSummaries(saved)
 	var lines strings.Builder
-	for _, m := range saved.Value.Mounts {
-		_, err := app.mountRoute(m)
-		available := err == nil
-		items = append(items, mountSummary{m.At, m.Driver, available, m.Connection})
-		if !a.json {
-			source, method := m.Driver, m.Connection
-			if source == AliPanWebsiteSource && method == "" {
-				source, method = savedSource(m)
+	if !a.json {
+		for _, item := range items {
+			fmt.Fprintln(&lines, item.label())
+			if item.Problem != nil && item.Problem.NextAction != "" {
+				for _, line := range strings.Split(item.Problem.NextAction, "\n") {
+					fmt.Fprintln(&lines, "  "+line)
+				}
 			}
-			fmt.Fprintf(&lines, "%q\t%q", m.At, source)
-			if method != "" {
-				fmt.Fprintf(&lines, " (%s)", method)
-			}
-			if !available {
-				lines.WriteString("\t(Driver unavailable in this build)")
-			}
-			lines.WriteByte('\n')
 		}
 	}
 	return struct {
@@ -59,38 +51,68 @@ func (app *App) runMount(ctx context.Context, saved ConfigSnapshot, a arguments,
 
 func (app *App) changeMount(ctx context.Context, saved ConfigSnapshot, a arguments, in io.Reader, diagnostics io.Writer) (any, string, error) {
 	base := filepath.Dir(saved.Path)
-	var prior MountRecord
-	if a.command != "mount add" {
-		if err := core.ValidatePath(a.operands[0]); err != nil {
+	var at string
+	if len(a.operands) != 0 {
+		at = mountedPath(a.operands[0], true)
+		if err := core.ValidatePath(at); err != nil {
 			return nil, "", err
 		}
-		i := slices.IndexFunc(saved.Value.Mounts, func(m MountRecord) bool { return m.At == a.operands[0] })
+	}
+	var ask Prompt
+	if a.from == "" && a.command.name != "remove" {
+		defer closeOnCancel(ctx, in)()
+		ask = promptInput(in, diagnostics)
+	}
+	if a.command.name == "edit" && at == "" && ask != nil {
+		var err error
+		at, err = app.chooseMount(saved, ask)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	var prior MountRecord
+	if a.command.name != "add" {
+		i := slices.IndexFunc(saved.Value.Mounts, func(m MountRecord) bool { return m.At == at })
 		if i < 0 {
 			return nil, "", core.Fail(core.NotFound, nil)
 		}
 		prior = saved.Value.Mounts[i]
-		if a.command == "mount remove" {
+		if a.command.name == "remove" {
 			saved.Value.Mounts = slices.Delete(saved.Value.Mounts, i, i+1)
 			applied, err := saved.Save(ctx)
 			return mountSaveResult(prior.At, "Removed mount %q from configuration.\n", applied, err)
 		}
 	}
-	var ask Prompt
-	if a.from == "" {
-		if reader, ok := in.(io.Closer); ok {
-			defer closeOnCancel(ctx, reader)()
-		}
-		ask = promptInput(in, diagnostics)
-	}
 	priorRoute, priorErr := app.mountRoute(prior)
 	var authorization ManagedAuthorization
+	var localError error
+	var websiteSettings bool
 	if ask != nil && prior.Driver != "" {
 		if priorErr != nil {
 			return nil, "", priorErr
 		}
+		localError = inspectMount(prior, priorRoute, base)
+		if localError != nil {
+			if _, err := fmt.Fprintln(diagnostics, AppProblem(app, localError).Message); err != nil {
+				return nil, "", err
+			}
+		}
 		if priorRoute.Setup != nil {
-			receipt, line, err := priorRoute.Setup(ctx, saved, prior, prior.At, ask, diagnostics)
-			return receipt, line, priorRoute.ProjectError(err)
+			if priorRoute.InspectWebsite != nil {
+				current := "settings"
+				if p := AppProblem(app, localError); p != nil && p.Reconnect {
+					current = "reconnect"
+				}
+				choice, err := askMenu(ask, "Edit mount", current, []string{"settings", "reconnect"}, []string{"Edit settings", "Sign in again"})
+				if err != nil {
+					return nil, "", err
+				}
+				websiteSettings = choice == "settings"
+			}
+			if !websiteSettings {
+				receipt, line, err := priorRoute.Setup(ctx, saved, prior, prior, ask, diagnostics)
+				return receipt, line, priorRoute.ProjectError(err)
+			}
 		}
 		authorization = priorRoute.managed
 	}
@@ -101,41 +123,35 @@ func (app *App) changeMount(ctx context.Context, saved ConfigSnapshot, a argumen
 	if ask != nil && authorization.available() && prior.Credential != nil && prior.Credential.Kind == ManagedCredential {
 		choices := []string{"settings", "switch"}
 		prompt := "Edit mount"
-		missing, statusErr := MissingGrant(prior.Credential.Ref)
-		if missing {
+		if MayReconnectGrant(localError) {
 			action, choices = "reconnect", []string{"reconnect", "settings"}
 			prompt = fmt.Sprintf("Reconnect %q to %s using its saved folder", prior.At, authorization.Label)
 		} else if authorization.Kind != StaticGrant {
 			choices = append(choices, "reauthorize")
 		}
-		action, err = AskChoice(ask, prompt+" ("+strings.Join(choices, ", ")+")", action, choices...)
+		action, err = AskMenu(ask, prompt, action, choices...)
 		if err != nil {
 			return nil, "", err
 		}
-		if action != "settings" && statusErr != nil {
-			return nil, "", statusErr
-		}
+
 	}
 	reconnecting := action == "reconnect"
-	switch action {
-	case "settings":
-		if ask == nil {
-			candidate, err = app.readMountRecord(ctx, a.from, prior, priorRoute, base, in)
-		} else {
-			var at string
-			if len(a.operands) != 0 {
-				at = a.operands[0]
-			}
-			candidate, err = app.promptMount(ctx, at, prior, priorRoute, saved, ask, diagnostics)
-			if route := candidate.source.Route; err == nil && route.Setup != nil {
-				receipt, line, err := route.Setup(ctx, saved, prior, candidate.record.At, ask, diagnostics)
+	switch {
+	case ask == nil:
+		candidate, err = app.readMountRecord(ctx, a.from, prior, priorRoute, base, in)
+	case action == "settings":
+		candidate, err = app.promptMount(ctx, at, prior, priorRoute, saved, ask, diagnostics)
+		if route := candidate.source.Route; err == nil && route.Setup != nil {
+			if !websiteSettings {
+				receipt, line, err := route.Setup(ctx, saved, prior, candidate.record, ask, diagnostics)
 				return receipt, line, route.ProjectError(err)
 			}
+			candidate.source, err = PrepareMountSource(app, candidate.record, base)
 		}
-	case "reauthorize", "switch", "reconnect":
+	default:
 		src, err := priorRoute.prepareMount(&prior.Options, base, nil)
 		if err == nil {
-			err = CheckAudience(app, prior, src, saved, SourceRecords(saved.Value.Mounts...))
+			_, err = admitMount(app, prior, src, saved, CredentialRecords(saved.Value.Mounts))
 		}
 		if err != nil {
 			return nil, "", err
@@ -177,23 +193,24 @@ func (app *App) changeMount(ctx context.Context, saved ConfigSnapshot, a argumen
 	if cancelErr := ctx.Err(); cancelErr != nil {
 		return nil, "", cancelErr
 	}
+	if err == nil && ask != nil {
+		err = validateRecord(candidate.record)
+	}
 	if err != nil {
 		return nil, "", err
 	}
 	m, src, grant := candidate.record, candidate.source, candidate.fresh
-	if err := validateRecord(m); err != nil {
-		return nil, "", err
-	}
 	unchanged := MountReceipt{m.At, core.Unchanged.String()}
-	if err := CheckAudience(app, m, src, saved, SourceRecords(saved.Value.Mounts...)); err != nil {
+	open, err := admitMount(app, m, src, saved, CredentialRecords(saved.Value.Mounts))
+	if err != nil {
 		return unchanged, "", err
 	}
-	credentialChanged := (m.Credential != nil || src.OptionalCredential && prior.Credential != nil) &&
+	credentialChanged := (m.Credential != nil || prior.Credential != nil) &&
 		!sameReference(m.Credential, prior.Credential, base)
 	optionsChanged := !bytes.Equal(m.Options, prior.Options)
 	probe := reconnecting || grant != nil || prior.At == "" || credentialChanged || m.Driver != prior.Driver || src.Route != priorRoute || src.ProbeOnChange && optionsChanged
 	reviewLocation := ask != nil && src.Route.review != ""
-	if !probe && optionsChanged && (src.KeyFile != "" || reviewLocation) {
+	if !probe && optionsChanged && (src.KeyFile != "" && !candidate.sameKeyFile || reviewLocation) {
 		old, err := priorRoute.prepareMount(&prior.Options, base, nil)
 		probe = err != nil || src.KeyFile != "" && old.KeyFile != src.KeyFile || reviewLocation && old.Location != src.Location
 	}
@@ -203,7 +220,8 @@ func (app *App) changeMount(ctx context.Context, saved ConfigSnapshot, a argumen
 			if grant != nil {
 				err = src.Route.managed.probeGrant(ctx, src, m, *grant)
 			} else {
-				err = app.probeMount(ctx, src, next, m, prior)
+				d, openErr := app.openMountDriver(ctx, src, open, next, m, CredentialRecords(next.Value.Mounts, prior), prior.At == "")
+				err = src.Route.ProjectError(src.verifyAndClose(ctx, d, openErr))
 			}
 			if err != nil {
 				return "", err
